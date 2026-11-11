@@ -3,9 +3,9 @@ import { long, short } from './i18n'
 
 export const manifest = setupManifest({
   id: 'lnd',
-  title: 'LND',
+  title: 'LND (Terminus)',
   license: 'MIT',
-  packageRepo: 'https://github.com/Start9Labs/lnd-startos',
+  packageRepo: 'https://github.com/dav1dpgit/lnd-startos-terminus',
   upstreamRepo: 'https://github.com/lightningnetwork/lnd',
   marketingUrl: 'https://lightning.engineering/',
   donationUrl: null,

@@ -1,3 +1,5 @@
+> **LND (Terminus)** — Start9's LND package with one patch for LIJOX providers. Read [TERMINUS.md](TERMINUS.md) first: what is changed, how to download, install and go back. The text below is Start9's own README.
+
 <p align="center">
   <img src="icon.svg" alt="LND Logo" width="21%">
 </p>

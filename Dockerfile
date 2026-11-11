@@ -1,5 +1,30 @@
 ARG RCLONE_VERSION=1.75.2
 
+# ---- LND (Terminus) ------------------------------------------------------------------------------------------------
+# Start9's LND package with one change: lnd and lncli are built from LND's own release tag with one additive patch
+# (patches/lnd-terminus.patch, proposed upstream in lightningnetwork/lnd): the funding manager negotiates zero-conf and
+# scid-alias channels explicitly with the static-remote-key commitment type, and OpenChannel carries the zero_conf /
+# scid_alias flags into a STATIC_REMOTE_KEY open. A node never asked for that channel type behaves as stock LND.
+# LND_TAG must be the tag in Start9's "FROM lightninglabs/lnd:" line below; TERMINUS_GO_IMAGE is the Go image of LND's
+# own Dockerfile at that tag. terminus/follow-start9.sh sets both. The build stamps "-terminus" into LND's version
+# (lncli getinfo → "version": "<x> commit=<tag>-terminus"), which is how the LIJOX adapter package tells this build
+# from stock LND. Everything outside this block and the two COPY lines at the end of the file is Start9's file.
+ARG LND_TAG=v0.21.6-beta
+ARG TERMINUS_GO_IMAGE=golang:1.27.3-alpine
+
+FROM ${TERMINUS_GO_IMAGE} AS terminus-builder
+ARG LND_TAG
+ENV GODEBUG=netdns=cgo
+RUN apk add --no-cache --update alpine-sdk git make gcc
+RUN git clone --depth 1 --branch ${LND_TAG} https://github.com/lightningnetwork/lnd /go/src/github.com/lightningnetwork/lnd
+COPY patches/lnd-terminus.patch /tmp/lnd-terminus.patch
+RUN cd /go/src/github.com/lightningnetwork/lnd \
+ && git apply --check /tmp/lnd-terminus.patch \
+ && git apply /tmp/lnd-terminus.patch \
+ && make release-install COMMIT=${LND_TAG}-terminus \
+ && sha256sum /go/bin/lnd /go/bin/lncli
+# ---- end of the LND (Terminus) builder ------------------------------------------------------------------------------
+
 # ---- rclone binary fetch ----
 FROM alpine:3.24 AS rclone-fetch
 RUN apk add --no-cache ca-certificates curl
@@ -37,3 +62,7 @@ COPY --from=lightninglabs/lndinit:v0.1.38-beta-lnd-v0.21.6-beta /bin/lndinit /bi
 
 # Continuous off-box copy of channel.backup (see startos/main.ts).
 COPY backup-agent.sh /usr/local/bin/backup-agent.sh
+
+# ---- LND (Terminus): the patched binaries replace the stock ones (everything else is Start9's image) ----------------
+COPY --from=terminus-builder /go/bin/lnd /bin/lnd
+COPY --from=terminus-builder /go/bin/lncli /bin/lncli

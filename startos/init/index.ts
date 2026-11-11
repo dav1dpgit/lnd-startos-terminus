@@ -5,6 +5,7 @@ import { versionGraph } from '../versions'
 import { setInterfaces, setupControlBinding } from '../interfaces'
 import { sdk } from '../sdk'
 import { seedFiles } from './seedFiles'
+import { terminusDefaults } from './terminusDefaults'
 import { setupCerts } from './setupCerts'
 import { taskConfigureChannelBackup } from './taskConfigureChannelBackup'
 import { tasksOnInstall } from './tasksOnInstall'
@@ -17,6 +18,7 @@ export const init = sdk.setupInit(
   setupControlBinding,
   versionGraph,
   seedFiles,
+  terminusDefaults,
   setInterfaces,
   actions,
   dependencies,

@@ -1,0 +1,16 @@
+import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
+
+export const v_0_21_5_beta_1 = VersionInfo.of({
+  version: '0.21.5-beta:1',
+  releaseNotes: {
+    en_US: `Establishes LND's control binding before migrations and certificate issuance, including when reinstalling over data carried from StartOS 0.3.5.1. REST and gRPC connection links still appear only once the wallet's admin macaroon exists.`,
+    es_ES: `Establece el enlace de control de LND antes de las migraciones y la emisión de certificados, incluso al reinstalar sobre datos procedentes de StartOS 0.3.5.1. Los enlaces de conexión REST y gRPC siguen apareciendo solo cuando existe el macaroon de administrador de la billetera.`,
+    de_DE: `Richtet die Kontroll-Portbindung von LND vor Migrationen und der Zertifikatsausstellung ein, auch bei einer Neuinstallation über Daten aus StartOS 0.3.5.1. REST- und gRPC-Verbindungslinks erscheinen weiterhin erst, wenn das Admin-Macaroon der Wallet vorhanden ist.`,
+    pl_PL: `Tworzy powiązanie portu kontrolnego LND przed migracjami i wystawieniem certyfikatów, także podczas ponownej instalacji na danych przeniesionych ze StartOS 0.3.5.1. Łącza połączeń REST i gRPC nadal pojawiają się dopiero po utworzeniu macaroon administratora portfela.`,
+    fr_FR: `Établit la liaison de contrôle de LND avant les migrations et l'émission des certificats, y compris lors d'une réinstallation sur des données provenant de StartOS 0.3.5.1. Les liens de connexion REST et gRPC n'apparaissent toujours qu'une fois le macaroon administrateur du portefeuille créé.`,
+  },
+  migrations: {
+    up: async () => {},
+    down: IMPOSSIBLE,
+  },
+})

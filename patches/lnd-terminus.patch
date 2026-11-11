@@ -1,0 +1,89 @@
+diff --git a/funding/commitment_type_negotiation.go b/funding/commitment_type_negotiation.go
+index e1cf8f3..c47fe99 100644
+--- a/funding/commitment_type_negotiation.go
++++ b/funding/commitment_type_negotiation.go
+@@ -231,6 +231,58 @@ func explicitNegotiateCommitmentType(channelType lnwire.ChannelType, local,
+ 		}
+ 		return lnwallet.CommitmentTypeTweakless, nil
+ 
++	// Static remote key + zero conf + scid alias features only (no
++	// anchors). The fundee side already tolerates a zero-conf channel
++	// without anchors (see funding manager: "We don't require anchors
++	// here - this is for compatibility with LDK"); these cases let the
++	// same channel be negotiated explicitly, so an LND node can open a
++	// zero-conf tweakless channel to a peer that asks for one.
++	case channelFeatures.OnlyContains(
++		lnwire.ZeroConfRequired,
++		lnwire.ScidAliasRequired,
++		lnwire.StaticRemoteKeyRequired,
++	):
++		if !hasFeatures(
++			local, remote,
++			lnwire.ZeroConfOptional,
++			lnwire.ScidAliasOptional,
++			lnwire.StaticRemoteKeyOptional,
++		) {
++
++			return 0, errUnsupportedChannelType
++		}
++		return lnwallet.CommitmentTypeTweakless, nil
++
++	// Static remote key + zero conf features only (no anchors).
++	case channelFeatures.OnlyContains(
++		lnwire.ZeroConfRequired,
++		lnwire.StaticRemoteKeyRequired,
++	):
++		if !hasFeatures(
++			local, remote,
++			lnwire.ZeroConfOptional,
++			lnwire.StaticRemoteKeyOptional,
++		) {
++
++			return 0, errUnsupportedChannelType
++		}
++		return lnwallet.CommitmentTypeTweakless, nil
++
++	// Static remote key + scid alias features only (no anchors).
++	case channelFeatures.OnlyContains(
++		lnwire.ScidAliasRequired,
++		lnwire.StaticRemoteKeyRequired,
++	):
++		if !hasFeatures(
++			local, remote,
++			lnwire.ScidAliasOptional,
++			lnwire.StaticRemoteKeyOptional,
++		) {
++
++			return 0, errUnsupportedChannelType
++		}
++		return lnwallet.CommitmentTypeTweakless, nil
++
+ 	// Simple taproot channels only (final feature bits).
+ 	case channelFeatures.OnlyContains(
+ 		lnwire.SimpleTaprootChannelsRequiredFinal,
+diff --git a/rpcserver.go b/rpcserver.go
+index ebfffb3..ab951d5 100644
+--- a/rpcserver.go
++++ b/rpcserver.go
+@@ -2326,9 +2326,19 @@ func (r *rpcServer) parseOpenChannelReq(in *lnrpc.OpenChannelRequest,
+ 
+ 	case lnrpc.CommitmentType_STATIC_REMOTE_KEY:
+ 		channelType = new(lnwire.ChannelType)
+-		*channelType = lnwire.ChannelType(*lnwire.NewRawFeatureVector(
++		fv := lnwire.NewRawFeatureVector(
+ 			lnwire.StaticRemoteKeyRequired,
+-		))
++		)
++
++		if in.ZeroConf {
++			fv.Set(lnwire.ZeroConfRequired)
++		}
++
++		if in.ScidAlias {
++			fv.Set(lnwire.ScidAliasRequired)
++		}
++
++		*channelType = lnwire.ChannelType(*fv)
+ 
+ 	case lnrpc.CommitmentType_ANCHORS:
+ 		channelType = new(lnwire.ChannelType)

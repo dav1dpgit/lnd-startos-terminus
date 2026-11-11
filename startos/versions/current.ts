@@ -1,28 +1,22 @@
-import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
-import { lndConfFile } from '../fileModels/lnd.conf'
-import { watchtowerPort } from '../interfaces'
+import { VersionInfo } from '@start9labs/start-sdk'
+
+// LND (Terminus) — written by terminus/apply.py from Start9's current version (0.21.6-beta:4); do not edit by hand.
+// A plain version just above Start9's, so every LND app's version rule (BTCPay, RTL, ...) accepts it. The data is
+// Start9's 0.21.6-beta:4 data unchanged, so both directions are no-ops: Start9's 0.21.6-beta:4 installs back over it, and Start9's
+// next release migrates from it as from 0.21.6-beta:4.
+const notes = "LND (Terminus) 0.21.6-beta:4.1: Start9's LND package 0.21.6-beta:4 with one additive patch to LND v0.21.6-beta. The patch lets this node open zero-conf, scid-alias channels with the static-remote-key commitment type (no anchors) \u2014 the channel LiJ-class wallets ask their LIJOX provider for. A node never asked for that channel type behaves exactly as Start9's build. Installing or updating this build turns on zero-conf and option-scid-alias (Channel Settings). The LND version line reads \"commit=v0.21.6-beta-terminus\". Update LND from the LIJOX registry: Start9's own LND update puts the stock build back (same data, no loss)."
 
 export const current = VersionInfo.of({
-  version: '0.21.6-beta:4',
+  version: '0.21.6-beta:4.1',
   releaseNotes: {
-    en_US:
-      'Requires StartOS 0.4.1 or later. Peers, watchtower clients and gRPC clients can now reach LND over your server’s IPv6 addresses.',
-    es_ES:
-      'Requiere StartOS 0.4.1 o posterior. Los pares, los clientes de watchtower y los clientes gRPC ahora pueden conectarse a LND a través de las direcciones IPv6 de tu servidor.',
-    de_DE:
-      'Erfordert StartOS 0.4.1 oder neuer. Peers, Watchtower-Clients und gRPC-Clients können LND jetzt über die IPv6-Adressen deines Servers erreichen.',
-    pl_PL:
-      'Wymaga StartOS 0.4.1 lub nowszego. Peery, klienci watchtowera i klienci gRPC mogą teraz łączyć się z LND przez adresy IPv6 twojego serwera.',
-    fr_FR:
-      'Nécessite StartOS 0.4.1 ou une version ultérieure. Les pairs, les clients watchtower et les clients gRPC peuvent désormais joindre LND via les adresses IPv6 de votre serveur.',
+    en_US: notes,
+    es_ES: notes,
+    de_DE: notes,
+    pl_PL: notes,
+    fr_FR: notes,
   },
   migrations: {
-    up: async ({ effects }) => {
-      if (await lndConfFile.read((c) => c['watchtower.listen']).once())
-        await lndConfFile.merge(effects, {
-          'watchtower.listen': [`[::]:${watchtowerPort}`],
-        })
-    },
-    down: IMPOSSIBLE,
+    up: async () => {},
+    down: async () => {},
   },
 })
