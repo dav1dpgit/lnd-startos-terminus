@@ -1,0 +1,1356 @@
+import { FileHelper, utils, z } from '@start9labs/start-sdk'
+import { manifest as bitcoinManifest } from 'bitcoin-core-startos/startos/manifest'
+import { base64 } from 'rfc4648'
+import { initializeWallet } from './actions/initializeWallet'
+import {
+  unlockWallet as unlockWalletAction,
+  unlockWalletTaskId,
+} from './actions/unlockWallet'
+import { lndConfFile } from './fileModels/lnd.conf'
+import { ImportPending, startupFlagsJson } from './fileModels/startupFlags.json'
+import { shape, storeJson } from './fileModels/store.json'
+import { unlockStatusJson } from './fileModels/unlock-status.json'
+import { vpnConfFile } from './fileModels/vpn.conf'
+import { i18n } from './i18n'
+import { sdk } from './sdk'
+import { migrateOnStart, needsSqliteMigration } from './sqliteBackend'
+import {
+  certPath,
+  getLndState,
+  isPastUnlock,
+  parseGatewayReply,
+  refusedWalletPassword,
+  serverActiveWithin,
+  STATE_TIMED_OUT,
+  UNLOCK_TIMEOUT_MS,
+} from './walletUnlocker'
+import {
+  handshakeStaleMs,
+  parseWireguardConfig,
+  renderWgQuick,
+  vpnDownScript,
+  vpnIface,
+  vpnUpScript,
+} from './vpn'
+import { mkdir, rm } from 'node:fs/promises'
+import {
+  backupFailureShape,
+  channelBackupStateJson,
+} from './fileModels/channel-backup-state.json'
+import { channelBackupJson } from './fileModels/channel-backup.json'
+import {
+  backupAgentScript,
+  bitcoindMnt,
+  describeFailures,
+  channelBackupPath,
+  getBitcoindBundle,
+  GetInfo,
+  literal,
+  lndDataDir,
+  localRestoreBackupPath,
+  localRestoreBackupTempPath,
+  remoteRestoreDir,
+  exportCredentials,
+  mainMounts,
+  neutrinoBundle,
+  selfGrpcHost,
+  selfRestUrl,
+  sleep,
+  unopenableChannelBackup,
+} from './utils'
+
+// Bounded by the channel db an origin node hands over — multi-GB on a busy
+// routing node, off a USB disk, over LAN. The SDK's 30 s exec default would
+// SIGKILL the copy long before it finished.
+const IMPORT_TIMEOUT_MS = 6 * 60 * 60_000
+
+// Well past the observed 36 s – 2 m 37 s a healthy node takes to reach
+// synced_to_graph, so crossing it means the elected peer is not answering.
+const GRAPH_SYNC_SLOW_MS = 15 * 60_000
+
+const BLOCK_PROBE_INTERVAL_MS = 5 * 60_000
+
+// getinfo's block_height follows headers, which keep arriving while block fetches fail.
+const fetchTipBlock = `set -o pipefail
+hash=$(timeout 30 lncli --rpcserver="$1" chain getbestblock | jq -r .block_hash) || exit
+timeout 60 lncli --rpcserver="$1" chain getblock --hash "$hash" >/dev/null && echo fetched`
+
+// LND gates synced_to_graph on one elected peer, and holds every other peer
+// passive until it finishes — so one unresponsive peer stalls all gossip, and
+// from getinfo alone that looks identical to a large backfill. Elapsed time is
+// what separates them.
+function graphSyncMessage(info: GetInfo, pendingSince: number | null) {
+  if (info.num_peers === 0) {
+    return i18n('Waiting for peers')
+  }
+
+  const elapsed = pendingSince === null ? 0 : Date.now() - pendingSince
+  if (elapsed < GRAPH_SYNC_SLOW_MS) {
+    return i18n('Syncing to graph')
+  }
+
+  return i18n(
+    'Graph sync has not completed in ${minutes} min (peers: ${peers}). LND retries with another peer every hour.',
+    { minutes: Math.floor(elapsed / 60_000), peers: info.num_peers },
+  )
+}
+
+// What `backup-agent.sh --pull` prints.
+const pullSummary = z.object({
+  retrieved: z.array(z.enum(['gdrive', 'dropbox', 'nextcloud', 'sftp'])),
+  unreachable: z.array(backupFailureShape),
+})
+
+/** Coarse age for a health message: seconds -> "3m" / "5h" / "2d". */
+function ago(seconds: number): string {
+  if (seconds < 90) return `${seconds}s`
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m`
+  if (seconds < 172800) return `${Math.round(seconds / 3600)}h`
+  return `${Math.round(seconds / 86400)}d`
+}
+
+type UnlockError = { kind: 'passphrase' | 'lnd'; message: string }
+
+export const main = sdk.setupMain(async ({ effects }) => {
+  /**
+   * ======================== Setup (optional) ========================
+   */
+  console.info(i18n('Starting LND!'))
+
+  const store = await storeJson
+    .read((s) => ({
+      walletPassword: s.walletPassword,
+      watchtowerClients: s.watchtowerClients,
+    }))
+    .const(effects)
+  if (!store) {
+    throw new Error('No store.json')
+  }
+  // The mode is the absence of the stored password, nothing else: one write of
+  // store.json turns it on or off, and that write already restarts main.
+  const coldStorage = !store.walletPassword
+  // One task and one notification per lock, not one per poll: each is latched
+  // only once it succeeds, and retried on the next poll until then.
+  const lockNoticed = { task: false, notified: false }
+  const attempt = (label: string, run: () => Promise<unknown>) =>
+    run().then(
+      () => true,
+      (e) => {
+        console.error(label, e)
+        return false
+      },
+    )
+
+  const onWalletLocked = async () => {
+    if (!lockNoticed.task) {
+      lockNoticed.task = await attempt('failed to post the unlock task', () =>
+        sdk.action.createOwnTask(effects, unlockWalletAction, 'important', {
+          reason: i18n('LND is locked until you enter the wallet password'),
+          replayId: unlockWalletTaskId,
+        }),
+      )
+    }
+    // Cold storage means every restart takes the node offline until someone
+    // acts, so it has to reach the user rather than only the dashboard.
+    if (!lockNoticed.notified) {
+      lockNoticed.notified = await attempt('failed to notify', () =>
+        sdk.notification.create(effects, {
+          level: 'warning',
+          title: i18n('Wallet Locked'),
+          message: i18n(
+            'LND has restarted and is waiting for its wallet password. It cannot route, send or receive until you run Unlock Wallet.',
+          ),
+        }),
+      )
+    }
+  }
+
+  // Left by a lifecycle that ran with the mode on, or re-posted by one after
+  // Turn Off had cleared it.
+  if (!coldStorage) {
+    await attempt('failed to clear the unlock task', () =>
+      sdk.action.clearTask(effects, unlockWalletTaskId),
+    )
+  }
+
+  // One-time startup flags live outside store.json — read with `.once`, not the
+  // `.const` watch above — so flipping them back after startup doesn't restart
+  // main. The action that sets resetWalletTransactions restarts LND itself via
+  // sdk.restart; here we only consume and then clear.
+  const startupFlags = await startupFlagsJson.read().once()
+  if (!startupFlags) {
+    throw new Error('No startup-flags.json')
+  }
+  const { resetWalletTransactions, restore, rotateMacaroonRootKey } =
+    startupFlags
+  let notified = startupFlags.notified
+  let graphSyncPendingSince: number | null = null
+  let blockProbe: {
+    at: number
+    error: string | null
+    failures: number
+    notified: boolean
+  } | null = null
+  let nextSyncProbeWarningAt = 0
+  let unlockError: UnlockError | null = null
+  const warnSyncProbe = (message: string, details: Record<string, unknown>) => {
+    const now = Date.now()
+    if (now < nextSyncProbeWarningAt) return
+    nextSyncProbeWarningAt = now + 300_000
+    console.warn(message, details)
+  }
+
+  const conf = await lndConfFile.read().const(effects)
+  if (!conf) {
+    throw new Error('No lnd.conf')
+  }
+
+  const useBitcoind = conf['bitcoin.node'] === 'bitcoind'
+
+  const { walletPassword, watchtowerClients } = store
+
+  let mounts = mainMounts
+
+  if (useBitcoind) {
+    mounts = mounts.mountDependency<typeof bitcoinManifest>({
+      dependencyId: 'bitcoind',
+      volumeId: 'main',
+      mountpoint: bitcoindMnt,
+      subpath: null,
+      readonly: true,
+    })
+  }
+
+  const lndSub = sdk.SubContainer.of(
+    effects,
+    { imageId: 'lnd' },
+    mounts,
+    'lnd-sub',
+  )
+
+  // Restart only when bitcoind writes a replacement cookie — an absent cookie
+  // means bitcoind is down, and stopping LND then hangs its shutdown.
+  if (useBitcoind) {
+    await FileHelper.string(`${await lndSub.rootfs}${bitcoindMnt}/.cookie`)
+      .read(
+        (cookie) => cookie,
+        (prev, next) => next === null || prev === next,
+      )
+      .const(effects)
+  }
+
+  const bitcoindPruned =
+    useBitcoind &&
+    !!(await FileHelper.ini(
+      `${await lndSub.rootfs}${bitcoindMnt}/bitcoin.conf`,
+      z.looseObject({ prune: z.coerce.number().catch(0) }),
+    )
+      .read(
+        (c) => c.prune > 0,
+        (prev, next) => next === null || prev === next,
+      )
+      .const(effects))
+
+  // Enforce backend bundle — ensures rpchost, rpccookie, zmq, fee.url and
+  // assumechanvalid stay in sync. This write also re-renders the conf through
+  // the file-model schema, which forces db.use-native-sql (CLI-only now) and
+  // the obsolete onion-message keys (custom-init/nodeann/message — bit 39
+  // crashes on 0.21, see lnd.conf.ts) to undefined, stripping any an upgraded
+  // node still carries.
+  await lndConfFile.merge(
+    effects,
+    {
+      ...(useBitcoind ? await getBitcoindBundle(effects) : neutrinoBundle),
+      'routing.assumechanvalid': bitcoindPruned || undefined,
+    },
+    { allowWriteAfterConst: true },
+  )
+
+  // LND reads its TLS pair once at startup, so re-running main is what carries
+  // a reissued certificate — a new address on the gRPC interface — to a client.
+  // Not armed ahead of a preparatory phase, which a re-run would abandon.
+  if (!startupFlags.importPending && !(await needsSqliteMigration())) {
+    await FileHelper.string(certPath).read().const(effects)
+  }
+
+  // Native SQL lives on the CLI, not the conf (see lnd.conf.ts).
+  const lndArgs: string[] = ['--db.use-native-sql']
+
+  const clearnetVpn = await storeJson.read((s) => s.clearnetVpn).const(effects)
+  const vpn = clearnetVpn && parseWireguardConfig(clearnetVpn.config)
+  if (vpn && 'error' in vpn) {
+    throw new Error(`invalid clearnet VPN configuration: ${vpn.error}`)
+  }
+  if (vpn) {
+    await mkdir(sdk.volumes.main.subpath('./vpn'), { recursive: true })
+    await vpnConfFile.write(effects, renderWgQuick(vpn.config))
+  } else {
+    await rm(sdk.volumes.main.subpath(`./vpn/${vpnIface}.conf`), {
+      force: true,
+    })
+  }
+
+  if (resetWalletTransactions) {
+    lndArgs.push('--reset-wallet-transactions')
+  }
+
+  /**
+   * ======================== Daemons ========================
+   *
+   * Three chains, one at a time, swapped by the reconciler: import → bolt →
+   * SQLite conversion → LND. Each is returned from the `Daemons.dynamic`
+   * builder below, whose `.const()` reads are its swap triggers — a change to
+   * one of them re-runs the builder and reconciles the difference, without
+   * restarting main.
+   *
+   * Both preparatory phases have to live here rather than ahead of the chain:
+   * an action is capped at 120 s by StartOS, and awaiting hours of work inside
+   * `setupMain` would leave the service stuck on "starting" with no health
+   * checks, no logs of its own, and no way to stop it. As phases they report
+   * progress through health checks and the service is running throughout.
+   */
+
+  /**
+   * Run `assets/import-<source>.sh`, which stops LND on the origin node, copies
+   * its data directory into the main volume, and leaves the origin's wallet
+   * password at /tmp/old-store.json for us to adopt. Scheduled by the Initialize
+   * Wallet action, which has already verified these credentials work.
+   */
+  const importChain = (source: ImportPending['source']) => {
+    const name = i18n('Wallet Import')
+    // Consecutive failures within this chain's lifetime — the oneshot's fn
+    // re-runs on retry, but this closure is built once per reconcile.
+    let failures = 0
+
+    return sdk.Daemons.of(effects).addOneshot('import', {
+      subcontainer: sdk.SubContainer.of(
+        effects,
+        { imageId: 'lnd' },
+        mainMounts.mountAssets({ subpath: null, mountpoint: '/scripts' }),
+        `import-${source}`,
+      ),
+      exec: {
+        fn: async (subcontainer, abort) => {
+          try {
+            // Read the pending import here, not in the builder above: the
+            // reconciler's configHash cannot see fn closures, so when only the
+            // credentials change (corrected via a fresh Initialize Wallet run)
+            // the rebuilt chain diffs to "leave alone" and the running daemon
+            // survives — this re-read on each retry is what picks the new
+            // credentials up.
+            const pending = await startupFlagsJson
+              .read((f) => f.importPending)
+              .once()
+            if (!pending) return null
+            const { label, env } = {
+              umbrel: {
+                label: 'Umbrel',
+                env: {
+                  UMBREL_HOST: pending.host,
+                  UMBREL_PASS: pending.password,
+                },
+              },
+              mynode: {
+                label: 'myNode',
+                env: {
+                  MYNODE_HOST: pending.host,
+                  MYNODE_PASS: pending.password,
+                },
+              },
+              startos: {
+                label: 'StartOS',
+                env: {
+                  STARTOS_HOST: pending.host,
+                  STARTOS_PASS: pending.password,
+                },
+              },
+            }[pending.source]
+            await sdk.setHealth(effects, {
+              id: 'import',
+              name,
+              result: 'loading',
+              message: i18n(
+                'Importing LND data from ${source}. Stopping the origin node and copying its data can take hours on a large node.',
+                { source: label },
+              ),
+            })
+
+            // Hand the abort signal to the copy: a stop leaves this fn running
+            // until it returns, so without it stopping the service would wait
+            // out the whole transfer. A killed copy is safe to repeat — the
+            // pending flag is still set and the origin is not released until
+            // the script's last step.
+            const res = await subcontainer.exec(
+              ['sh', `/scripts/import-${pending.source}.sh`],
+              {
+                env,
+                timeout: IMPORT_TIMEOUT_MS,
+                abort: { abort: abort.reason, signal: abort },
+              },
+            )
+            if (res.exitCode !== 0) {
+              const stderr = String(res.stderr)
+                .trim()
+                .split('\n')
+                .slice(-3)
+                .join(' ')
+              throw new Error(`Import from ${label} failed: ${stderr}`)
+            }
+
+            const dump = await subcontainer.exec(['cat', '/tmp/old-store.json'])
+            const oldStore =
+              dump.exitCode === 0 && typeof dump.stdout === 'string'
+                ? shape.safeParse(JSON.parse(dump.stdout))
+                : null
+            if (!oldStore?.success || !oldStore.data.walletPassword) {
+              throw new Error(
+                i18n(
+                  'Failed to read the wallet password from the origin node.',
+                ),
+              )
+            }
+
+            // Adopt the origin's password before clearing the flag. An
+            // interruption between the two only repeats the import; the reverse
+            // order could leave imported data behind with no password that
+            // opens it, which is what the conversion phase then fails on.
+            //
+            // store.json is `.const`-watched above, so this write does restart
+            // main — allowWriteAfterConst only suppresses the write's own guard
+            // (fileHelper.ts), not the watch. The teardown that follows aborts
+            // this fn's signal but awaits its promise, so the two writes below
+            // still land and the restarted main opens on the conversion phase.
+            await storeJson.merge(
+              effects,
+              { walletPassword: oldStore.data.walletPassword },
+              { allowWriteAfterConst: true },
+            )
+
+            await sdk.setHealth(effects, {
+              id: 'import',
+              name,
+              result: 'success',
+              message: i18n('Imported LND data from ${source}.', {
+                source: label,
+              }),
+            })
+
+            // Swaps this phase out for whatever the data needs next.
+            await startupFlagsJson.merge(effects, { importPending: false })
+            return null
+          } catch (e) {
+            // A oneshot's own health is internal to the chain — the SDK
+            // publishes nothing for it — so every exit path has to leave this
+            // check at a terminal result of its own, or a failed import shows
+            // as an idle service.
+            await sdk.setHealth(effects, {
+              id: 'import',
+              name,
+              result: 'failure',
+              message: utils.asError(e).message,
+            })
+            // Three straight failures is not a blip. The action is hidden and
+            // its critical task was cleared when the migration was scheduled,
+            // so without this there is no UI route back to correct the address
+            // or password, or to fall back to Start Fresh — the exact dead end
+            // this feature exists to avoid. Re-posting the critical task also
+            // stops the service, which is what ends the retry loop; the
+            // pending flag stays set so the wallet-exists guard knows any
+            // copied data is an incomplete import.
+            failures += 1
+            if (failures >= 3 && !abort.aborted) {
+              await sdk.action
+                .createOwnTask(effects, initializeWallet, 'critical', {
+                  reason: i18n(
+                    'The wallet migration failed and needs attention',
+                  ),
+                })
+                .catch((err) =>
+                  console.error(
+                    'failed to re-post the initialize-wallet task',
+                    err,
+                  ),
+                )
+            }
+            throw e
+          }
+        },
+      },
+      requires: [],
+    })
+  }
+
+  /**
+   * Convert an imported bolt database to SQLite before LND opens it. Reports its
+   * own phases through the `db-migration` health check and, on success, writes
+   * the completion flag that swaps this phase out for LND (sqliteBackend.ts).
+   */
+  const conversionChain = () =>
+    sdk.Daemons.of(effects).addOneshot('db-conversion', {
+      subcontainer: null,
+      exec: {
+        // The conversion drives nested runUntilSuccess chains that take no
+        // abort signal, and teardown awaits this fn — so without the race a
+        // Stop would wait out the whole conversion. On abort the fn unblocks
+        // and throws; the abandoned run keeps going only until main's context
+        // leaves and reaps its chains. That interruption is the same one a
+        // power cut inflicts, which the conversion is built to resume from.
+        fn: async (_, abort) => {
+          try {
+            await Promise.race([
+              migrateOnStart(effects),
+              new Promise<never>((_resolve, reject) => {
+                const stop = () =>
+                  reject(new Error('Stopped during the database conversion'))
+                if (abort.aborted) return stop()
+                abort.addEventListener('abort', stop, { once: true })
+              }),
+            ])
+          } catch (e) {
+            if (!abort.aborted) {
+              await sdk.setHealth(effects, {
+                id: 'db-migration',
+                name: i18n('Database Conversion'),
+                result: 'failure',
+                message: utils.asError(e).message,
+              })
+            }
+            throw e
+          }
+          return null
+        },
+      },
+      requires: [],
+    })
+
+  const blockFetchError = async () => {
+    const now = Date.now()
+    const probe = (blockProbe ??= {
+      at: now,
+      error: null,
+      failures: 0,
+      notified: false,
+    })
+    if (now - probe.at < BLOCK_PROBE_INTERVAL_MS) return probe.error
+    probe.at = now
+    const res = await lndSub
+      .exec(['sh', '-c', fetchTipBlock, 'sh', selfGrpcHost], {
+        timeout: 120_000,
+      })
+      .catch(() => null)
+    if (!res) return probe.error
+    if (String(res.stdout).trim() === 'fetched') {
+      probe.error = null
+      probe.failures = 0
+      return null
+    }
+    const stderr = String(res.stderr).trim()
+    console.warn('sync-progress: LND could not fetch the tip block', {
+      exitCode: res.exitCode,
+      stderr: stderr.slice(-2_000),
+    })
+    const error =
+      res.exitCode === 143 || res.exitCode === null
+        ? i18n('timed out')
+        : stderr
+            .split('\n')
+            .at(-1)!
+            .replace(/^\[lncli\] (rpc error: code = \w+ desc = )?/, '') ||
+          `exit code ${res.exitCode}`
+    probe.error = error
+    probe.failures += 1
+    if (probe.failures >= 2 && !probe.notified) {
+      probe.notified = await attempt('failed to notify', () =>
+        sdk.notification.create(effects, {
+          level: 'error',
+          title: i18n('LND Is Not Seeing New Blocks'),
+          message: i18n(
+            'Bitcoin is not serving blocks to LND, so LND cannot see new blocks or respond in time to a channel breach or an expiring HTLC. Check the Bitcoin service. Last error: ${error}',
+            { error: literal(error) },
+          ),
+        }),
+      )
+    }
+    return error
+  }
+
+  const lndChain = () => {
+    const vpnStartedAt = Date.now()
+    let lastLndState: string | null = null
+    // A timeout means LND accepted the connection, so its last answer still stands.
+    const lndStateNow = async () => {
+      const state = await getLndState(STATE_TIMED_OUT)
+      if (state !== STATE_TIMED_OUT) lastLndState = state
+      return { state: lastLndState, slow: state === STATE_TIMED_OUT }
+    }
+    return sdk.Daemons.of(effects)
+      .addOneshot('stage-local-restore', () =>
+        restore
+          ? {
+              subcontainer: lndSub,
+              exec: {
+                fn: async (subcontainer, abort) => {
+                  const res = await subcontainer.exec(
+                    [
+                      'sh',
+                      '-c',
+                      `rm -f '${localRestoreBackupTempPath}'; if [ -s '${channelBackupPath}' ]; then cp '${channelBackupPath}' '${localRestoreBackupTempPath}' && mv -f '${localRestoreBackupTempPath}' '${localRestoreBackupPath}'; elif [ -e '${channelBackupPath}' ]; then echo 'channel.backup is empty' >&2; exit 1; else rm -f '${localRestoreBackupPath}'; fi`,
+                    ],
+                    {
+                      timeout: 60_000,
+                      abort: { abort: abort.reason, signal: abort },
+                    },
+                  )
+                  if (res.exitCode !== 0) {
+                    throw new Error(
+                      `failed to stage the StartOS channel backup: ${String(res.stderr).trim()}`,
+                    )
+                  }
+                  return null
+                },
+              },
+              requires: [],
+            }
+          : null,
+      )
+      .addOneshot('vpn', {
+        subcontainer: lndSub,
+        exec: {
+          fn: async (subcontainer, abort) => {
+            const res = await subcontainer.exec(
+              ['sh', '-c', vpn ? vpnUpScript : vpnDownScript],
+              {
+                timeout: 60_000,
+                abort: { abort: abort.reason, signal: abort },
+              },
+            )
+            if (res.exitCode !== 0) {
+              throw new Error(
+                `failed to bring the clearnet VPN ${vpn ? 'up' : 'down'}: ${String(res.stderr).trim()}`,
+              )
+            }
+            return null
+          },
+        },
+        requires: [],
+      })
+      .addDaemon('lnd', {
+        exec: { command: ['lnd', ...lndArgs] },
+        subcontainer: lndSub,
+        ready: {
+          display: i18n('LND Server'),
+          fn: async () => {
+            const { state, slow } = await lndStateNow()
+            // Any non-success here stops every daemon that requires `lnd`.
+            // WAITING_TO_START (255) is earliest in the state machine — the
+            // wallet unlocker sub-server isn't up yet, so don't let the
+            // unlock-wallet oneshot fire. LOCKED onward means the unlocker
+            // endpoint is serving.
+            if (!state || state === 'WAITING_TO_START') {
+              return { result: 'starting', message: null }
+            }
+            return {
+              result: 'success',
+              message: slow
+                ? i18n('LND is running but slow to respond')
+                : i18n('LND is ready'),
+            }
+          },
+        },
+        requires: restore ? ['stage-local-restore', 'vpn'] : ['vpn'],
+      })
+      .addOneshot('unlock-wallet', {
+        exec: {
+          fn: async (subcontainer, abort) => {
+            // Provenance for Turn On and Unlock Wallet: only an unlock this
+            // oneshot itself performed sets the first, and every lifecycle
+            // starts with neither.
+            await unlockStatusJson.write(effects, {
+              storedPasswordVerified: false,
+              storedPasswordRefused: false,
+            })
+            while (true) {
+              if (abort.aborted) {
+                console.log('wallet-unlock aborted')
+                return null
+              }
+
+              // Skip the unlock call (and its noisy LND error log) only when
+              // the wallet is strictly past LOCKED. Per stateservice.proto:
+              //   NON_EXISTING=0, LOCKED=1, UNLOCKED=2, RPC_ACTIVE=3,
+              //   SERVER_ACTIVE=4, WAITING_TO_START=255.
+              // WAITING_TO_START means "not started yet" — keep polling.
+              const state = await getLndState()
+              if (isPastUnlock(state)) {
+                console.log(`wallet-unlock skipped, state=${state}`)
+                // Whoever opened it, the task is done.
+                if (coldStorage) {
+                  await attempt('failed to clear the unlock task', () =>
+                    sdk.action.clearTask(effects, unlockWalletTaskId),
+                  )
+                }
+                lockNoticed.task = lockNoticed.notified = false
+                unlockError = null
+                break
+              }
+              if (state !== 'LOCKED') {
+                // NON_EXISTING, WAITING_TO_START, or endpoint unreachable —
+                // wallet unlocker isn't ready for a POST yet.
+                await sleep(2_000)
+                continue
+              }
+
+              // Cold storage: the password is off the server, so this oneshot
+              // waits for the user to unlock rather than unlocking itself. It
+              // must keep waiting rather than return — sync-progress and what
+              // waits behind it require it, and completing here would release
+              // those against a locked wallet and skip the flag clearing below.
+              if (coldStorage) {
+                await onWalletLocked()
+                await sleep(5_000)
+                continue
+              }
+
+              if (!walletPassword)
+                throw new Error('Wallet Password is undefined!')
+
+              const pw = base64.stringify(Buffer.from(walletPassword, 'latin1'))
+              // changepassword also unlocks, so it replaces the unlock call
+              // rather than joining it. Passing the same password back is what
+              // keeps this a macaroon rotation and not a password change; LND
+              // regenerates the root key and rewrites every macaroon file.
+              const body = rotateMacaroonRootKey
+                ? JSON.stringify({
+                    current_password: pw,
+                    new_password: pw,
+                    new_macaroon_root_key: true,
+                  })
+                : restore
+                  ? JSON.stringify({
+                      wallet_password: pw,
+                      recovery_window: 2_500,
+                    })
+                  : JSON.stringify({ wallet_password: pw })
+              const res = await subcontainer.exec(
+                [
+                  'curl',
+                  '--no-progress-meter',
+                  '-X',
+                  'POST',
+                  '--cacert',
+                  `${lndDataDir}/tls.cert`,
+                  rotateMacaroonRootKey
+                    ? `${selfRestUrl}/v1/changepassword`
+                    : `${selfRestUrl}/v1/unlockwallet`,
+                  '--data-binary',
+                  '@-',
+                ],
+                { input: body, timeout: UNLOCK_TIMEOUT_MS },
+              )
+              const stdout = res.stdout.toString().trim()
+              const reply = parseGatewayReply(stdout)
+              const message =
+                typeof reply?.message === 'string' && reply.message.trim()
+                  ? reply.message.trim()
+                  : null
+
+              // A successful rotation response carries the new admin macaroon.
+              console.log('wallet-unlock response', {
+                exitCode: res.exitCode,
+                stdout: rotateMacaroonRootKey ? '(redacted)' : stdout,
+                stderr: String(res.stderr).trim(),
+              })
+              if (
+                res.exitCode === 0 &&
+                (rotateMacaroonRootKey
+                  ? typeof reply?.admin_macaroon === 'string' &&
+                    reply.admin_macaroon.length > 0
+                  : stdout === '{}' ||
+                    stdout.includes('wallet already unlocked'))
+              ) {
+                if (!rotateMacaroonRootKey) {
+                  unlockError = null
+                  // A wallet found already open proves nothing about the
+                  // stored password.
+                  await unlockStatusJson.merge(effects, {
+                    storedPasswordVerified: stdout === '{}',
+                    storedPasswordRefused: false,
+                  })
+                }
+                break
+              }
+              if (!rotateMacaroonRootKey) {
+                unlockError = message
+                  ? {
+                      kind: refusedWalletPassword.test(message)
+                        ? 'passphrase'
+                        : 'lnd',
+                      message,
+                    }
+                  : null
+                if (unlockError?.kind === 'passphrase') {
+                  await unlockStatusJson.merge(effects, {
+                    storedPasswordRefused: true,
+                  })
+                }
+              }
+              await sleep(10_000)
+            }
+            // Cleared here, not from a dependent oneshot: a restart lands in
+            // the window between the two and arms the flag for every start after.
+            await startupFlagsJson.merge(effects, {
+              resetWalletTransactions: false,
+              rotateMacaroonRootKey: false,
+            })
+            return null
+          },
+        },
+        subcontainer: lndSub,
+        requires: ['lnd'],
+      })
+      .addHealthCheck('wallet-unlock', {
+        ready: {
+          display: i18n('Wallet Unlock'),
+          trigger: sdk.trigger.statusTrigger(30_000, {
+            starting: 1_000,
+            failure: 10_000,
+          }),
+          fn: async () => {
+            const { state } = await lndStateNow()
+            if (state === 'LOCKED' && unlockError) {
+              return {
+                result: 'failure',
+                message:
+                  unlockError.kind === 'passphrase'
+                    ? i18n('LND refused the stored wallet password: ${error}', {
+                        error: literal(unlockError.message),
+                      })
+                    : i18n('LND could not unlock the wallet: ${error}', {
+                        error: literal(unlockError.message),
+                      }),
+              }
+            }
+            // Under cold storage a locked wallet is not a passing phase: the
+            // node stays offline until someone acts, so it has to read as a
+            // fault rather than as start-up.
+            if (state === 'LOCKED' && coldStorage) {
+              return {
+                result: 'failure',
+                message: i18n('Locked. Run Unlock Wallet to bring LND online.'),
+              }
+            }
+            if (isPastUnlock(state)) {
+              return { result: 'success', message: i18n('Wallet is unlocked') }
+            }
+            return { result: 'starting', message: null }
+          },
+        },
+        requires: ['lnd'],
+      })
+      .addHealthCheck('sync-progress', {
+        ready: {
+          display: i18n('Network and Graph Sync Progress'),
+          fn: async () => {
+            const startedAt = Date.now()
+            let res
+            try {
+              // The SDK's own timeout orphans lncli (Start9Labs/start-technologies#4054).
+              res = await lndSub.exec(
+                [
+                  'timeout',
+                  '25',
+                  'lncli',
+                  `--rpcserver=${selfGrpcHost}`,
+                  'getinfo',
+                ],
+                { timeout: 30_000 },
+              )
+            } catch (error) {
+              warnSyncProbe('sync-progress: lncli getinfo threw', {
+                durationMs: Date.now() - startedAt,
+                error: utils.asError(error),
+              })
+              // The LND subcontainer can be momentarily absent while main is
+              // re-running (e.g. Bitcoin's .cookie rotates on its restart,
+              // which tears down lnd-sub to rebuild it). With no PID 1 in the
+              // subcontainer, exec can't join its namespaces and throws a
+              // filesystem I/O error (".../proc/1/ns/pid: No such file or
+              // directory") instead of returning a result. Treat that as "still
+              // coming up" — the lnd daemon's own `ready` check reflects a
+              // genuine crash separately.
+              return { message: i18n('LND is starting…'), result: 'starting' }
+            }
+            if (
+              res.exitCode === 0 &&
+              res.stdout !== '' &&
+              typeof res.stdout === 'string'
+            ) {
+              const info: GetInfo = JSON.parse(res.stdout)
+
+              if (info.synced_to_graph) {
+                graphSyncPendingSince = null
+              } else if (graphSyncPendingSince === null) {
+                graphSyncPendingSince = Date.now()
+              }
+
+              if (info.synced_to_chain) {
+                blockProbe = null
+              } else if (useBitcoind) {
+                const error = await blockFetchError()
+                if (error !== null) {
+                  return {
+                    message: i18n(
+                      'Bitcoin is not serving blocks to LND: ${error}',
+                      { error: literal(error) },
+                    ),
+                    result: 'loading',
+                  }
+                }
+              }
+
+              if (info.synced_to_chain && info.synced_to_graph) {
+                if (!notified) {
+                  notified = await attempt('failed to notify', async () => {
+                    await sdk.notification.create(effects, {
+                      level: 'success',
+                      title: i18n('Sync Complete'),
+                      message: i18n('LND is synced to chain and graph.'),
+                    })
+                    await startupFlagsJson.merge(effects, { notified: true })
+                  })
+                }
+                return {
+                  message: i18n('Synced to chain and graph'),
+                  result: 'success',
+                }
+              } else if (!info.synced_to_chain && info.synced_to_graph) {
+                return {
+                  message: i18n('Syncing to chain'),
+                  result: 'loading',
+                }
+              } else if (!info.synced_to_graph && info.synced_to_chain) {
+                return {
+                  message: graphSyncMessage(info, graphSyncPendingSince),
+                  result: 'loading',
+                }
+              }
+
+              return {
+                message: i18n('Syncing to graph and chain'),
+                result: 'loading',
+              }
+            }
+
+            warnSyncProbe(
+              'sync-progress: lncli getinfo returned no usable output',
+              {
+                durationMs: Date.now() - startedAt,
+                exitCode: res.exitCode,
+                exitSignal: res.exitSignal,
+                stdoutBytes:
+                  typeof res.stdout === 'string'
+                    ? Buffer.byteLength(res.stdout)
+                    : null,
+                stderr:
+                  typeof res.stderr === 'string'
+                    ? res.stderr.trim().slice(-2_000)
+                    : null,
+              },
+            )
+
+            // getinfo's start-up refusal changes wording per LND release; /v1/state doesn't.
+            if ((await lndStateNow()).state === 'SERVER_ACTIVE') {
+              return {
+                message: i18n('LND is running but not responding'),
+                result: 'loading',
+              }
+            }
+            return {
+              message: i18n('LND is starting…'),
+              result: 'starting',
+            }
+          },
+        },
+        requires: ['lnd', 'unlock-wallet'],
+      })
+      .addOneshot('restore', () =>
+        restore
+          ? {
+              subcontainer: lndSub,
+              exec: {
+                fn: async (subcontainer, abort) => {
+                  const run = (command: string[], timeout: number) =>
+                    subcontainer.exec(command, {
+                      timeout,
+                      abort: { abort: abort.reason, signal: abort },
+                    })
+                  const tail = (out: unknown) =>
+                    String(out).trim().split('\n').slice(-2).join(' ')
+                  const warning = i18n(
+                    'Lightning Labs strongly recommends against continuing to use a LND node after running restorechanbackup. Please recover and sweep any remaining funds to another wallet. Afterwards LND should be uninstalled. LND can then be re-installed fresh if you would like to continue using LND.',
+                  )
+                  const notice = (message: string) =>
+                    sdk.setHealth(effects, {
+                      id: 'restored',
+                      name: i18n('Backup Restoration Detected'),
+                      message,
+                      result: 'failure',
+                    })
+
+                  if (!(await serverActiveWithin(60 * 60_000, abort)))
+                    throw new Error(
+                      abort.aborted
+                        ? 'aborted before LND finished starting'
+                        : 'LND did not finish starting within an hour',
+                    )
+
+                  // Every copy is offered and LND keeps the union: it skips
+                  // channels it already holds, so nothing has to be compared.
+                  let noticed = false
+                  const offer = async (path: string, label: string) => {
+                    if (!noticed) {
+                      await notice(warning)
+                      noticed = true
+                    }
+                    const res = await run(
+                      [
+                        'lncli',
+                        `--rpcserver=${selfGrpcHost}`,
+                        'restorechanbackup',
+                        '--multi_file',
+                        path,
+                      ],
+                      3_600_000,
+                    )
+                    if (res.exitCode === 0) {
+                      console.log(`restored channels from ${label}`)
+                      return
+                    }
+                    const reason = tail(res.stderr)
+                    // Only a file LND cannot open is the copy's own fault:
+                    // another seed's, or damaged.
+                    if (unopenableChannelBackup.test(reason)) {
+                      console.warn(
+                        `skipped the channel.backup from ${label}: ${reason}`,
+                      )
+                      return
+                    }
+                    throw new Error(
+                      `restorechanbackup failed for ${label}: ${reason}`,
+                    )
+                  }
+
+                  const staged = await run(
+                    ['test', '-s', localRestoreBackupPath],
+                    30_000,
+                  )
+                  if (staged.exitCode === 0) {
+                    await offer(localRestoreBackupPath, 'the StartOS backup')
+                  } else if (staged.exitCode !== 1) {
+                    throw new Error(
+                      `failed to check the staged channel backup: ${tail(staged.stderr)}`,
+                    )
+                  }
+
+                  // A target that cannot be reached is waited for: its copy may
+                  // be the only one holding a channel opened since the StartOS
+                  // backup. Clearing the target's credentials ends the wait.
+                  const offered = new Set<string>()
+                  while (true) {
+                    const pull = await run(
+                      ['sh', backupAgentScript, '--pull'],
+                      600_000,
+                    )
+                    if (pull.exitCode !== 0 && pull.exitCode !== 6) {
+                      throw new Error(
+                        `could not retrieve the channel backups: ${tail(pull.stderr)}`,
+                      )
+                    }
+                    const summary = pullSummary.parse(
+                      JSON.parse(String(pull.stdout).trim()),
+                    )
+                    for (const provider of summary.retrieved) {
+                      if (offered.has(provider)) continue
+                      await offer(`${remoteRestoreDir}/${provider}`, provider)
+                      offered.add(provider)
+                    }
+                    if (pull.exitCode === 0) break
+                    await notice(
+                      `${warning} ${i18n(
+                        'A backup target has not answered, so the channel.backup it holds has not been restored yet: ${detail} To stop waiting for it, clear its saved credentials in Configure Continuous Backups.',
+                        {
+                          detail: literal(
+                            describeFailures(summary.unreachable),
+                          ),
+                        },
+                      )}`,
+                    )
+                    await sleep(300_000, abort)
+                    if (abort.aborted)
+                      throw new Error('aborted while waiting for a target')
+                  }
+
+                  const removed = await run(
+                    [
+                      'rm',
+                      '-rf',
+                      localRestoreBackupPath,
+                      localRestoreBackupTempPath,
+                      remoteRestoreDir,
+                    ],
+                    30_000,
+                  )
+                  if (removed.exitCode !== 0) {
+                    throw new Error(
+                      `failed to remove the staged channel backups: ${tail(removed.stderr)}`,
+                    )
+                  }
+                  await startupFlagsJson.merge(effects, { restore: false })
+                  return null
+                },
+              },
+              requires: ['lnd', 'unlock-wallet'],
+            }
+          : null,
+      )
+      .addHealthCheck('reachability', () =>
+        !conf.externalip?.length && !conf.externalhosts?.length
+          ? {
+              ready: {
+                display: i18n('Node Reachability'),
+                fn: () => ({
+                  result: 'disabled',
+                  message: i18n(
+                    'Your node can peer with other nodes, but other nodes cannot peer with you. Optionally add a Tor domain, public domain, or public IP address to change this behavior.',
+                  ),
+                }),
+              },
+              requires: ['lnd'],
+            }
+          : null,
+      )
+      .addHealthCheck('vpn-tunnel', () =>
+        vpn
+          ? {
+              ready: {
+                display: i18n('Clearnet VPN'),
+                trigger: sdk.trigger.statusTrigger(30_000, {
+                  starting: 5_000,
+                  failure: 30_000,
+                }),
+                fn: async () => {
+                  const noHandshake = () => {
+                    const ageMs = Date.now() - vpnStartedAt
+                    return ageMs > handshakeStaleMs
+                      ? {
+                          result: 'failure' as const,
+                          message: i18n(
+                            'No WireGuard handshake for ${minutes} minutes. Clearnet traffic is held until the tunnel returns, not sent over your ISP connection.',
+                            { minutes: String(Math.floor(ageMs / 60_000)) },
+                          ),
+                        }
+                      : {
+                          result: 'starting' as const,
+                          message: i18n(
+                            'Waiting for the first WireGuard handshake.',
+                          ),
+                        }
+                  }
+                  let res
+                  try {
+                    res = await lndSub.exec(
+                      ['wg', 'show', vpnIface, 'latest-handshakes'],
+                      { timeout: 10_000 },
+                    )
+                  } catch {
+                    return noHandshake()
+                  }
+                  if (res.exitCode !== 0) return noHandshake()
+                  const epoch = Number(
+                    String(res.stdout).trim().split(/\s+/)[1] ?? 0,
+                  )
+                  if (!epoch) return noHandshake()
+                  const ageMs = Date.now() - epoch * 1000
+                  if (ageMs > handshakeStaleMs) {
+                    return {
+                      result: 'failure',
+                      message: i18n(
+                        'No WireGuard handshake for ${minutes} minutes. Clearnet traffic is held until the tunnel returns, not sent over your ISP connection.',
+                        { minutes: String(Math.floor(ageMs / 60_000)) },
+                      ),
+                    }
+                  }
+                  return {
+                    result: 'success',
+                    message: i18n(
+                      'Tunnel up; last handshake ${seconds}s ago.',
+                      {
+                        seconds: String(Math.floor(ageMs / 1000)),
+                      },
+                    ),
+                  }
+                },
+              },
+              requires: ['vpn'],
+            }
+          : null,
+      )
+      .addOneshot('add-watchtowers', () =>
+        watchtowerClients.length > 0
+          ? ({
+              subcontainer: lndSub,
+              exec: {
+                fn: async (subcontainer: typeof lndSub, abort) => {
+                  // Setup watchtowers at runtime because for some reason they can't be setup in lnd.conf
+                  for (const tower of watchtowerClients || []) {
+                    if (abort.aborted) break
+                    console.log(`Watchtower client adding ${tower}`)
+                    let res = await subcontainer.exec(
+                      [
+                        'lncli',
+                        `--rpcserver=${selfGrpcHost}`,
+                        'wtclient',
+                        'add',
+                        tower,
+                      ],
+                      { abort: { abort: abort.reason, signal: abort } },
+                    )
+
+                    if (
+                      res.exitCode === 0 &&
+                      res.stdout !== '' &&
+                      typeof res.stdout === 'string'
+                    ) {
+                      console.log(`Result adding tower ${tower}: ${res.stdout}`)
+                    } else {
+                      console.log(
+                        `Error adding tower ${tower}: ${String(res.stderr)}`,
+                      )
+                    }
+                  }
+                  return null
+                },
+              },
+              requires: ['lnd', 'unlock-wallet', 'sync-progress'],
+            } as const)
+          : null,
+      )
+      .addOneshot('export-credentials', {
+        subcontainer: lndSub,
+        exec: {
+          fn: async (subcontainer, abort) => {
+            while (!abort.aborted) {
+              const res = await subcontainer.exec(
+                ['sh', '-c', exportCredentials],
+                { abort: { abort: abort.reason, signal: abort } },
+              )
+              if (res.exitCode === 0) return null
+              console.log(
+                `export-credentials: retrying: ${String(res.stderr).trim()}`,
+              )
+              await sleep(5_000, abort)
+            }
+            return null
+          },
+        },
+        requires: ['lnd', 'unlock-wallet'],
+      })
+      .addDaemon('channel-backup-agent', {
+        subcontainer: sdk.SubContainer.of(
+          effects,
+          { imageId: 'lnd' },
+          mounts,
+          'channel-backup-sub',
+        ),
+        exec: { command: ['sh', backupAgentScript] },
+        ready: {
+          display: null,
+          fn: async () => ({ result: 'success', message: null }),
+        },
+        requires: restore
+          ? ['lnd', 'unlock-wallet', 'restore']
+          : ['lnd', 'unlock-wallet'],
+      })
+      .addHealthCheck('channel-backup', {
+        ready: {
+          display: i18n('Continuous Backup'),
+          trigger: sdk.trigger.statusTrigger(30_000, {
+            starting: 5_000,
+          }),
+          fn: async () => {
+            const cfg = await channelBackupJson.read().once()
+            if (
+              ![
+                cfg?.gdrive,
+                cfg?.dropbox,
+                cfg?.nextcloud,
+                cfg?.sftp,
+                cfg?.email,
+              ].some((t) => t?.enabled)
+            ) {
+              return {
+                result: 'disabled',
+                message: i18n(
+                  'No continuous backup target. channel.backup travels only inside the StartOS backups you take yourself, so channels opened since your last one are not covered.',
+                ),
+              }
+            }
+            const state = await channelBackupStateJson.read().once()
+            if (state?.failures.length) {
+              return {
+                result: 'failure',
+                message: describeFailures(state.failures),
+              }
+            }
+            if (state?.lastSuccess) {
+              const agoText = ago(
+                Math.max(0, Math.floor(Date.now() / 1000) - state.lastSuccess),
+              )
+              const restoreTargets = [
+                cfg?.gdrive,
+                cfg?.dropbox,
+                cfg?.nextcloud,
+                cfg?.sftp,
+              ].some((t) => t?.enabled)
+              return {
+                result: 'success',
+                message: restoreTargets
+                  ? i18n('Copied to every enabled target ${ago} ago', {
+                      ago: agoText,
+                    })
+                  : i18n(
+                      'Sent by email ${ago} ago. A StartOS restore does not read email: after one, run Restore Channels from File with the newest attachment.',
+                      { ago: agoText },
+                    ),
+              }
+            }
+            return {
+              result: 'starting',
+              message: i18n(
+                'No channel.backup yet: LND writes it once it has caught up with the chain.',
+              ),
+            }
+          },
+        },
+        requires: ['channel-backup-agent'],
+      })
+  }
+
+  return sdk.Daemons.dynamic(effects, async ({ effects: dynEffects }) => {
+    const importPending = await startupFlagsJson
+      .read((f) => f.importPending)
+      .const(dynEffects)
+    // Arms the second swap trigger: the conversion phase writes this flag when
+    // it finishes. Its other inputs are on-disk files that needsSqliteMigration
+    // stats for itself, and dbSchemaFinalized is deliberately not watched — it
+    // flips mid-conversion, and swapping chains then would abandon the run.
+    await startupFlagsJson.read((f) => f.dbMigrationComplete).const(dynEffects)
+
+    // Order is load-bearing: LND must never open an un-imported or un-converted
+    // data directory, so each preparatory phase holds the chain until the flag
+    // or the on-disk state that selected it is gone.
+    if (importPending) return importChain(importPending.source)
+    if (await needsSqliteMigration()) return conversionChain()
+    return lndChain()
+  })
+})

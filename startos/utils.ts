@@ -1,0 +1,273 @@
+import { T } from '@start9labs/start-sdk'
+import {
+  rpcHostId as btcRpcHostId,
+  rpcPort as btcRpcPort,
+  zmqHostId as btcZmqHostId,
+  zmqPortBlock as btcZmqPortBlock,
+  zmqPortTransaction as btcZmqPortTransaction,
+} from 'bitcoin-core-startos/startos/utils'
+import { i18n } from './i18n'
+import { gRPCPort, restPort } from './interfaces'
+import { sdk } from './sdk'
+import type { BackupFailure } from './fileModels/channel-backup-state.json'
+
+export const lndDataDir = '/root/.lnd'
+export const bitcoindMnt = '/mnt/bitcoin'
+export const mainVolumeHost = '/media/startos/volumes/main'
+
+// For untrusted text passed as an i18n parameter: the SDK substitutes with
+// String.replace, which reads `$&`, `$'` and `` $` `` in the value as patterns.
+export const literal = (text: string) => text.replace(/\$/g, '$$$$')
+// The watchtower *server* database (client sessions + their state-update
+// backups), distinct from the wtclient db under data/graph. Deleted whenever
+// the server is disabled — by the action and, as a backstop, by the migration.
+export const watchtowerServerDir = `${mainVolumeHost}/data/watchtower`
+
+/**
+ * LND's own endpoints for its self-calls. Loopback rather than the bridge: the
+ * bridge answers REST with the proxy's device cert, failing the `tls.cert` pin.
+ */
+export const selfRestUrl = `https://127.0.0.1:${restPort}`
+export const selfGrpcHost = `127.0.0.1:${gRPCPort}`
+
+/**
+ * bitcoind connection settings for lnd.conf. Each address is its own `.const()`
+ * on a single string, so main re-runs only when an address it uses actually
+ * changes (bitcoind install/uninstall/port-change), not on a plain bitcoind
+ * update. Replaces the static `bitcoind.startos` host.
+ */
+export const getBitcoindBundle = async (effects: T.Effects) => {
+  const zmqAddr = (internalPort: number) =>
+    sdk.host
+      .getBridgeAddress(effects, {
+        packageId: 'bitcoind',
+        hostId: btcZmqHostId,
+        internalPort,
+      })
+      .const()
+
+  const rpchost = await sdk.host
+    .getBridgeAddress(effects, {
+      packageId: 'bitcoind',
+      hostId: btcRpcHostId,
+      internalPort: btcRpcPort,
+      ssl: false,
+    })
+    .const()
+  const block = await zmqAddr(btcZmqPortBlock)
+  const tx = await zmqAddr(btcZmqPortTransaction)
+
+  return {
+    'bitcoin.node': 'bitcoind' as const,
+    'bitcoind.rpchost': rpchost ?? undefined,
+    'bitcoind.rpccookie': `${bitcoindMnt}/.cookie`,
+    'bitcoind.zmqpubrawblock': block ? `tcp://${block}` : undefined,
+    'bitcoind.zmqpubrawtx': tx ? `tcp://${tx}` : undefined,
+    'fee.url': undefined,
+  }
+}
+
+export const neutrinoBundle = {
+  'bitcoin.node': 'neutrino',
+  'bitcoind.rpchost': undefined,
+  'bitcoind.rpccookie': undefined,
+  'bitcoind.zmqpubrawblock': undefined,
+  'bitcoind.zmqpubrawtx': undefined,
+  'fee.url': 'https://nodes.lightning.computer/fees/v1/btc-fee-estimates.json',
+} as const
+
+export const publicDir = '/mnt/public'
+
+export const mainMounts = sdk.Mounts.of()
+  .mountVolume({
+    volumeId: 'main',
+    subpath: null,
+    mountpoint: lndDataDir,
+    readonly: false,
+  })
+  .mountVolume({
+    volumeId: 'public',
+    subpath: null,
+    mountpoint: publicDir,
+    readonly: false,
+  })
+
+// Grants invoice and payment RPCs, never channel or node administration.
+const paymentsRpcMethods = [
+  '/lnrpc.Lightning/ChannelBalance',
+  '/lnrpc.Lightning/AddInvoice',
+  '/lnrpc.Lightning/LookupInvoice',
+  '/lnrpc.Lightning/SubscribeInvoices',
+  '/routerrpc.Router/SendPaymentV2',
+  '/routerrpc.Router/TrackPaymentV2',
+  '/invoicesrpc.Invoices/AddHoldInvoice',
+  '/invoicesrpc.Invoices/SettleInvoice',
+  '/invoicesrpc.Invoices/CancelInvoice',
+] as const
+
+export const exportCredentials = `set -e
+cd ${publicDir}
+mkdir -p payments readonly admin
+rm -f payments/.macaroon
+timeout 25 lncli --rpcserver=${selfGrpcHost} bakemacaroon --save_to payments/.macaroon ${paymentsRpcMethods.map((method) => `uri:${method}`).join(' ')}
+mv payments/.macaroon payments/payments.macaroon
+cp ${lndDataDir}/data/chain/bitcoin/mainnet/readonly.macaroon readonly/.macaroon
+mv readonly/.macaroon readonly/readonly.macaroon
+cp ${lndDataDir}/data/chain/bitcoin/mainnet/admin.macaroon admin/.macaroon
+mv admin/.macaroon admin/admin.macaroon
+for tier in payments readonly admin; do
+  cp ${lndDataDir}/tls.cert $tier/.tls.cert
+  mv $tier/.tls.cert $tier/tls.cert
+done`
+
+export type GetInfo = {
+  identity_pubkey: string
+  alias: string
+  uris: string[]
+  num_peers: number
+  synced_to_chain: boolean
+  synced_to_graph: boolean
+}
+
+export const seedGrid = (words: string[]) => {
+  const width = Math.max(...words.map((w) => w.length))
+  return Array.from({ length: Math.ceil(words.length / 4) }, (_, row) =>
+    words
+      .slice(row * 4, row * 4 + 4)
+      .map(
+        (w, i) => `${String(row * 4 + i + 1).padStart(2)}. ${w.padEnd(width)}`,
+      )
+      .join('  ')
+      .trimEnd(),
+  ).join('\n')
+}
+
+export function sleep(ms: number, abort?: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    abort?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer)
+        resolve()
+      },
+      { once: true },
+    )
+  })
+}
+
+export const channelBackupPath = `${lndDataDir}/data/chain/bitcoin/mainnet/channel.backup`
+export const localRestoreBackupPath = `${lndDataDir}/channel.backup.startos-restore`
+export const localRestoreBackupTempPath = `${localRestoreBackupPath}.tmp`
+export const remoteRestoreDir = `${lndDataDir}/.channel-backup-restore`
+export const unopenableChannelBackup =
+  /unable to (decrypt|read nonce)|message authentication failed|unknown multi-version|unexpected EOF|payload size too small/i
+export const undialableScbPeer =
+  /unable to connect to peer ([0-9a-f]{66}) for SCB restore/
+export const backupAgentScript = '/usr/local/bin/backup-agent.sh'
+export const backupFolderDefault = 'lnd-channel-backups'
+
+// rclone's nextcloud vendor refuses any address that does not end in
+// /remote.php/dav/files/USER — the form neither Nextcloud's UI nor StartOS's
+// Nextcloud interface shows.
+export function nextcloudDavUrl(
+  address: string,
+  user: string,
+  previousUser?: string,
+): string {
+  let url: URL
+  try {
+    url = new URL(address)
+  } catch {
+    throw new Error(i18n('Nextcloud: that is not a valid address.'))
+  }
+  if (!user) return address
+
+  const existing = url.pathname.match(/^(.*\/dav\/files\/)([^/]+)(\/.*)?$/)
+  if (existing) {
+    let pathUser = ''
+    try {
+      pathUser = decodeURIComponent(existing[2])
+    } catch {}
+    if (previousUser && previousUser !== user && pathUser === previousUser) {
+      url.pathname = `${existing[1]}${encodeURIComponent(user)}${existing[3] ?? '/'}`
+      return url.toString()
+    }
+    return address
+  }
+
+  const base = url.pathname
+    .replace(/\/+$/, '')
+    .replace(
+      /\/(remote\.php\/(dav(\/files)?|webdav)|index\.php.*|apps\/.*)$/,
+      '',
+    )
+  return `${url.origin}${base}/remote.php/dav/files/${encodeURIComponent(user)}/`
+}
+
+export const channelBackupProviderName = (target: string) =>
+  ({
+    gdrive: i18n('Google Drive'),
+    dropbox: i18n('Dropbox'),
+    nextcloud: i18n('Nextcloud'),
+    sftp: i18n('SFTP'),
+    email: i18n('Email'),
+    agent: i18n('Continuous Backup'),
+  })[target] ?? target
+
+/** One sentence per failure record backup-agent.sh leaves in the state file. */
+function describeFailure(f: BackupFailure): string {
+  const target = channelBackupProviderName(f.target)
+  const detail = literal(f.detail)
+  switch (f.code) {
+    case 'upload':
+    case 'publish':
+    case 'local':
+      return i18n('${target}: upload failed: ${detail}', { target, detail })
+    case 'check':
+      return i18n('${target}: could not be checked: ${detail}', {
+        target,
+        detail,
+      })
+    case 'hostkey':
+      return i18n(
+        '${target}: no host key is recorded for this server. Save the SFTP target again to record it.',
+        { target },
+      )
+    case 'hostkey-unverified':
+      return i18n(
+        '${target}: its host key has not been confirmed. Compare the fingerprint shown when the target was saved, then save it again with Host key verified turned on.',
+        { target },
+      )
+    case 'timeout':
+      return i18n(
+        '${target}: not reached before the run ran out of time. The watcher retries on its own.',
+        { target },
+      )
+    case 'signin':
+      return f.target === 'gdrive'
+        ? i18n(
+            '${target}: Google refused the saved sign-in. Sign in again in Configure Continuous Backups. While the Google Cloud app is in Testing, Google ends every sign-in after 7 days; publishing the app stops that.',
+            { target },
+          )
+        : i18n(
+            '${target}: the saved sign-in was refused. Sign in again in Configure Continuous Backups.',
+            { target },
+          )
+    case 'nocreds':
+      return f.target === 'gdrive' || f.target === 'dropbox'
+        ? i18n(
+            '${target}: not signed in yet. Finish the sign-in in Configure Continuous Backups.',
+            { target },
+          )
+        : i18n(
+            '${target}: its saved settings are incomplete. Save it again in Configure Continuous Backups.',
+            { target },
+          )
+    default:
+      return `${target}: ${f.code} ${f.detail}`.trim()
+  }
+}
+
+export const describeFailures = (failures: BackupFailure[]) =>
+  failures.map(describeFailure).join(' ')

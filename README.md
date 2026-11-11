@@ -1,0 +1,444 @@
+> **LND (Terminus)** — Start9's LND package with one patch for LIJOX providers. Read [TERMINUS.md](TERMINUS.md) first: what is changed, how to download, install and go back. The text below is Start9's own README.
+
+<p align="center">
+  <img src="icon.svg" alt="LND Logo" width="21%">
+</p>
+
+# LND on StartOS
+
+> Everything not listed in this document should behave the same as upstream
+> LND. If a feature, setting, or behavior is not mentioned here, the upstream
+> documentation is accurate and fully applicable — see the Documentation
+> section of `instructions.md` for links.
+
+[LND](https://github.com/lightningnetwork/lnd) is a Lightning Network node implementation. This package runs it on SQLite rather than bolt, issues and reissues its TLS certificate for the addresses StartOS assigns, and can create a wallet, restore one from a seed, or import one wholesale from another node.
+
+- **Upstream repo:** <https://github.com/lightningnetwork/lnd>
+- **Wrapper repo:** <https://github.com/Start9Labs/lnd-startos>
+
+---
+
+## Table of Contents
+
+- [Image and Container Runtime](#image-and-container-runtime)
+- [Volume and Data Layout](#volume-and-data-layout)
+- [File Models](#file-models)
+- [Dependencies](#dependencies)
+- [Network Access and Interfaces](#network-access-and-interfaces)
+- [Installation and First-Run Flow](#installation-and-first-run-flow)
+- [Actions](#actions)
+- [Tasks](#tasks)
+- [Health Checks](#health-checks)
+- [Backups and Restore](#backups-and-restore)
+- [Limitations and Differences](#limitations-and-differences)
+- [Quick Reference for AI Consumers](#quick-reference-for-ai-consumers)
+
+---
+
+## Image and Container Runtime
+
+The image is built here to add the migration, import, and channel-backup tools used by the package.
+
+| Property      | Value                                                                                                     |
+| ------------- | --------------------------------------------------------------------------------------------------------- |
+| Image         | Built from `Dockerfile` — upstream `lnd` plus migration, import, and channel-backup tooling               |
+| Architectures | x86_64, aarch64                                                                                           |
+| Subcontainers | `lnd-sub` — the `lnd` daemon, and the one to `attach` to; `channel-backup-sub` — the channel-backup agent |
+
+The added tools are `curl`, `sqlite3`, OpenSSH, `sshpass`, `rclone`, `flock`, `wireguard-tools`, `lndinit`, and `backup-agent.sh`. `rclone` comes from its upstream release with a pinned checksum, not from Alpine's packages. A separate `import-<source>` subcontainer is created when a wallet import is scheduled. The manifest sets `virtualNetworking`, which is what lets the container create the tunnel interface the hidden Clearnet VPN action brings up.
+
+**`main` runs in one of three modes**, and only the third is the ordinary one:
+
+1. **Import** — a wallet migration from another node is pending, so the only thing running is the copy.
+2. **Conversion** — a bolt database the update migration did not convert (an import or a restored pre-conversion backup) has to be converted before LND may open it.
+3. **Normal** — the LND daemon, the channel-backup agent, and their supporting oneshots.
+
+## Volume and Data Layout
+
+Two volumes, plus a read-only view of Bitcoin's.
+
+| Volume   | Mount Point   | Purpose                                                                                                                                                               |
+| -------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main`   | `/root/.lnd`  | `lnd.conf`, wallet and channel data, TLS and macaroons, `store.json`, `startup-flags.json`, `channel.backup`, `channel-backup.json`, and `.channel-backup-state.json` |
+| `public` | `/mnt/public` | Credentials for dependent services, one subdirectory per tier, each with a copy of `tls.cert`. Not backed up                                                          |
+
+**Dependents mount a tier of `public`, never `main`**, which holds the seed and wallet password in `store.json`. The `export-credentials` oneshot rewrites every tier on each start once the wallet is unlocked, so a reissued certificate or a rotated macaroon root key reaches them on the next start:
+
+| Tier       | Macaroon             | Can                                                                                                                       |
+| ---------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `payments` | `payments.macaroon`  | RPC allowlist in `startos/utils.ts`: read channel balance; create, look up, and subscribe to invoices; create, settle, and cancel hold invoices; send and track Lightning payments. No channel administration, on-chain spending, or payment-history deletion |
+| `readonly` | `readonly.macaroon`  | LND's own read-only macaroon                                                                                              |
+| `admin`    | `admin.macaroon`     | LND's own admin macaroon: full control of the node                                                                        |
+
+Bitcoin's data directory is mounted **read-only** at `/mnt/bitcoin` when bitcoind is the backend — that is how LND reads its RPC cookie.
+
+## File Models
+
+Five models, and the split between two of them is load-bearing.
+
+| File                         | Format | Modelled                | Written by                                                              |
+| ---------------------------- | ------ | ----------------------- | ----------------------------------------------------------------------- |
+| `lnd.conf`                   | INI    | Yes — `FileHelper.ini`  | Every init, every start, and the config actions                         |
+| `store.json`                 | JSON   | Yes — `FileHelper.json` | Install, and the wallet and watchtower actions                          |
+| `startup-flags.json`         | JSON   | Yes — `FileHelper.json` | Actions, the restore hook, and `main` as it consumes them               |
+| `channel-backup.json`        | JSON   | Yes — `FileHelper.json` | The Configure Continuous Backups action                                 |
+| `.channel-backup-state.json` | JSON   | Yes — `FileHelper.json` | `backup-agent.sh`, on every backup attempt                              |
+| `cold-storage.json`          | JSON   | Yes — `FileHelper.json` | Every init and the Cold Storage actions; nothing reads it under a watch |
+| `unlock-status.json`         | JSON   | Yes — `FileHelper.json` | `main`'s unlock oneshot; excluded from backups                          |
+
+**`channel-backup.json` holds the credentials for each backup target** — an OAuth refresh token, an app password, an SSH private key, or an SMTP login, depending on the target. It is included in the StartOS backup so the channel-backup agent keeps its configuration after a restore. `.channel-backup-state.json` is excluded, so a restored node reports its own backup health rather than the health of the machine it came from.
+
+**`startup-flags.json` is deliberately not part of `store.json`.** `main` reads the store under a watch that restarts the service on any change, so clearing a consumed flag there would restart the service in a loop — the bug that once made Reset Wallet Transactions re-run on every start. The flags file is read once instead, and cleared without triggering anything.
+
+### lnd.conf
+
+**Enforced** — rewritten whenever the package writes the file: the listen addresses (peer on dual-stack `[::]`; gRPC on separate `0.0.0.0` and `[::]` listeners; REST on `0.0.0.0`, which StartOS reaches over IPv4), `bitcoin.mainnet`, `rpcmiddleware.enable`, and `db.backend`. `bitcoind.rpcuser`, `bitcoind.rpcpass`, and the deprecated `bitcoin.active` and `tor.v3` are modelled as "must be absent" and deleted — Bitcoin authentication is the cookie read through the mount.
+
+Five values depart from LND's own defaults. The first two are enforced, and the rest are starting points a config action can change:
+
+| Key                                 | Upstream default | Set here          | Why                                                                                                                                                    |
+| ----------------------------------- | ---------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `db.backend`                        | bolt             | `sqlite`          | New installs are born on SQLite; existing bolt nodes are converted before LND opens the data                                                           |
+| `healthcheck.chainbackend.attempts` | 3                | `0`               | LND's own backend monitor is disabled — see below                                                                                                      |
+| `debuglevel`                        | `info`           | `info,BTWL=error` | Keeps Info logging while silencing btcwallet's per-block warnings. A node whose `lnd.conf` already says `info`, as nodes from 0.3.5.1 do, keeps `info` |
+| `stagger-initial-reconnect`         | `false`          | `true`            | Spreads the startup reconnect burst over 30 s; the first 10 peers still dial immediately                                                               |
+| `caches.rpc-graph-cache-duration`   | `0` (disabled)   | `1m`              | One graph read answers simultaneous `DescribeGraph` callers instead of one read each                                                                   |
+
+**On the graph cache:** LND ships the `DescribeGraph` cache off. `lncfg/caches.go` defines `DefaultRPCGraphCacheDuration = time.Minute`, but nothing wires it into `DefaultConfig`, so the field holds its zero value and `rpcserver.go` reads that as "disabled" — true in every release to date. Uncached, each call walks the whole graph, and concurrent callers each walk it separately. That is expensive here in particular: the graph lives in `lnd.sqlite` under `--db.use-native-sql`, read a hundred rows at a time, and each walk holds one of the pool's connections from start to finish. With the cache on, callers serialize on one mutex and only the first walks. Sixteen packages across the two registries depend on this node, and Mempool and Ride The Lightning both fetch `/v1/graph`. The cached response is not keyed on the request's `include_unannounced` flag, so a caller that asks for unannounced channels can leave them in the slot for the next caller that did not; Mempool and RTL both request public-only, and a short duration bounds the window.
+
+**On the SQLite pool:** the file model forces `db.sqlite.maxconnections` absent, leaving LND's upstream default of 2 connections per SQLite database. `InvoicesSettledSince` reads through its existing transaction, without borrowing a second pool connection ([lightningnetwork/lnd#11347](https://github.com/lightningnetwork/lnd/pull/11347)). Concurrent invoice subscriptions can resume from settle indexes without exhausting the pool.
+
+**On the disabled backend check:** it is a much weaker signal than its name suggests. It issues `uptime` and counts the backend's outbound peers, never retrieving a block, so it stays green against a node that answers headers but cannot serve blocks. Exhausting its attempts does not stop LND either — the shutdown path is wired to a Critical log line and has been for many releases. Re-enabling it would buy a log line, not a safety net.
+
+Two further keys are forced absent for correctness rather than preference: **`db.use-native-sql`**, because the conversion's bolt-mode run reads the same file and bolt rejects native SQL, so it is passed on the daemon's command line instead; and the three **onion-message protocol overrides**, which LND 0.21 advertises natively and which now make it abort at startup if still present.
+
+**Derived, on every start:** the Bitcoin backend bundle — RPC host, cookie path, and both ZeroMQ addresses — resolved from Bitcoin's own bindings, plus `routing.assumechanvalid=true` while Bitcoin is pruned. Selecting Neutrino instead swaps the whole bundle out and sets a fee URL, because Neutrino cannot estimate fees locally.
+
+**On a pruned Bitcoin:** `routing.assumechanvalid` stops LND fetching the block behind every channel announcement, which a pruned node would have to pull from its peers one by one until LND stops answering. The graph is taken on trust from gossip, as LND does on Neutrino by default, and a closed channel leaves it once both directions are disabled or stop updating rather than when its funding output is spent. Only the routing graph is affected; LND watches the node's own channels on-chain either way. LND logs the key as deprecated on every start but still honours it.
+
+**Yours:** everything the config actions expose — alias and colour, channel and routing-fee policy, autopilot, performance flags, Tor settings, and the watchtower server and client.
+
+### store.json and startup-flags.json
+
+`store.json` holds the wallet password, the seed if the package generated one, the registered watchtower clients, any custom external hosts, and the Clearnet VPN's WireGuard configuration and public address (`clearnetVpn`), kept verbatim. `vpn/wg0.conf` is generated from it on every start — a `wg-quick` file with `Table = off` and the policy-routing rules as `PostUp` lines — and is never hand-edited.
+
+`startup-flags.json` holds one-time requests: a pending wallet import (**including the origin node's password**, since nothing else persists it), a wallet-transaction reset, a macaroon rotation, a restore marker, and whether the sync notification has fired. Each is consumed by `main` and cleared once the work it asked for has run.
+
+## Dependencies
+
+Both are optional and conditional on configuration.
+
+| Dependency | When                         | Kind      | Health checks               | Mount                     |
+| ---------- | ---------------------------- | --------- | --------------------------- | ------------------------- |
+| Bitcoin    | The backend is bitcoind      | `running` | `bitcoind`, `sync-progress` | `/mnt/bitcoin`, read-only |
+| Tor        | Tor is enabled in the config | `running` | `tor`                       | none                      |
+
+Choosing bitcoind also raises a `critical` task on **Bitcoin** requiring ZeroMQ — see [Tasks](#tasks).
+
+The daemon **restarts when Bitcoin writes a replacement RPC cookie**, but not when the cookie merely disappears: an absent cookie means Bitcoin is down, and stopping LND at that moment hangs its shutdown. It also restarts when pruning is turned on or off in Bitcoin's `bitcoin.conf`, to set or clear `routing.assumechanvalid`.
+
+## Network Access and Interfaces
+
+Four interfaces, two of which appear only once a wallet exists.
+
+| Interface        | Id                 | Type | Port  | Present                        |
+| ---------------- | ------------------ | ---- | ----- | ------------------------------ |
+| Peer             | `peer`             | p2p  | 9735  | always                         |
+| Watchtower       | `watchtower`       | p2p  | 9911  | always exported                |
+| REST LND Connect | `lnd-connect-rest` | api  | 8080  | once the admin macaroon exists |
+| gRPC LND Connect | `grpc`             | api  | 10009 | once the admin macaroon exists |
+
+The REST/control binding is established before version migrations, authorizing the loopback and bridge IPs used by the conversion's TLS certificate. The normal interface pass declares all four bindings independently of wallet credentials; only the connection-URI exports wait for credentials. The gRPC URI takes its trust anchor directly from StartOS's root CA, independently of the local `tls.cert` file.
+
+**The two connect interfaces embed credentials in their address.** Each carries the macaroon — and, for gRPC, the server's root CA certificate, DER-encoded as the `lndconnect` scheme specifies — as query parameters, which is what lets a wallet app pair by scanning one. Both are masked for that reason. They cannot exist before the wallet is created, because the macaroon does not exist until then; the package watches for it and publishes them when it appears.
+
+**REST and gRPC are terminated differently, and not interchangeably.** REST goes through the reverse proxy. gRPC does not: a proxy rewrap negotiates no ALPN, and gRPC clients reject the connection outright for it — so its binding passes TLS through and the client validates the certificate LND itself serves, anchored on the root CA its connect URI carries.
+
+**The watchtower interface is always exported**, even when the server is off. LND simply does not listen on it until the server is enabled, and then listens on `[::]`, IPv4 and IPv6 alike.
+
+**A server carried over from StartOS 0.3.5** had gRPC on the `control` host's internal port 10009, beside REST's 8080. The 0.21.4-beta:1 migration retires that port; gRPC is served from its own `grpc` host, and no address moves to it.
+
+## Installation and First-Run Flow
+
+Install raises **two `critical` tasks** and the service does not run until both are cleared: choose a Bitcoin backend, and set up a wallet.
+
+Wallet setup is the substantial one, and [Initialize Wallet](#actions) offers two paths:
+
+- **Create** a new wallet, generating a seed the package records.
+- **Import** an entire node from Umbrel, myNode, or another StartOS server on 0.4.0 or later — copying its data directory over the network.
+
+An import changes what happens next. The copy runs as the only thing in the service, bounded at six hours because a busy routing node's channel database is multi-gigabyte over LAN. If the imported node was on bolt, a **conversion phase** then runs before LND is allowed to open the data, reporting its own progress as a separate health check. Only after that does LND itself start.
+
+The TLS pair is issued at init for every address LND answers on — the container and bridge addresses, plus every address the gRPC interface is served at — and **reissued whenever that set changes**. The internal half is what REST needs, since the proxy dials the container by IP; the external half is what a gRPC client validates against, since nothing terminates that binding's TLS but LND.
+
+## Actions
+
+Twenty-five actions: ten configure the node, three manage its wallet and credentials, two send and receive payments, two report node information, two manage continuous backups, one restores channels from a supplied backup, three manage Cold Storage, one manages a companion-provided VPN, and one serves dependent packages. Four of them are always hidden from the ordinary Actions list.
+
+### Configuration
+
+Nine actions grouped under Configuration, each writing its own part of `lnd.conf`: **General Settings** (alias, colour, keysend and AMP), **Routing Fees**, **Channel Settings** (acceptance policy plus the forwarding switch), **Autopilot Settings**, **Tor Settings**, **Custom External Host**, **Performance**, **Watchtower Server**, and **Watchtower Client Settings**. Each costs seconds plus a restart, is pre-filled from the current file, and is safe to re-run.
+
+**Bitcoin Backend** is in the same group but `visibility: 'hidden'` — it is reached through the install task rather than browsed to. It chooses bitcoind or Neutrino, and with it the dependency set, the mount, and the whole backend section of the config.
+
+**Watchtower Server** additionally deletes the watchtower server's database when the server is switched off, so a disabled tower does not keep client session state it can no longer serve.
+
+**Channel Settings** carries `reject-htlc` ("Reject Routing Requests"), the node-wide forwarding switch. When on, LND fails every onward HTLC with `FailChannelDisabled` and logs `node configured to disallow forwards`; sending and receiving are unaffected, since locally-sourced and final-hop HTLCs never reach the switch's forwarding path. The channels stay announced and enabled in gossip, so peers keep attempting routes and keep failing — it rejects forwards, it does not remove the node from the graph. Restart-only; there is no runtime toggle.
+
+### Initialize Wallet — hidden
+
+**Not in the Actions list.** It is `visibility: 'hidden'` and `only-stopped`, reached through the install task. It creates or imports a wallet as described above, and for an import it verifies the origin's credentials before scheduling the copy — so a wrong password fails here rather than six hours later. Re-running it with corrected credentials replaces the pending import without disturbing anything else.
+
+### Reset Wallet Transactions
+
+Rescans the chain, rebuilding the wallet's transaction history. Run it when on-chain balances or transactions look wrong.
+
+- **What it changes:** sets a one-time flag and restarts LND, which does the rescan on its next start; the flag is cleared afterwards so it does not repeat.
+- **Cost:** a full rescan, which takes time proportional to the wallet's age.
+- **Repeat safety:** safe to re-run. It asks for confirmation before running.
+
+### Revoke Macaroons
+
+Rotates the macaroon root key, invalidating **every** macaroon this node has issued.
+
+- **What it changes:** sets a one-time flag; the rotation happens at the next start. The unlock oneshot requires a successful curl exit and a nonempty `admin_macaroon` response before accepting the rotation. A transport failure or empty reply is retried rather than consuming the request.
+- **Repeat safety:** safe, but every application connected to this node must be re-paired afterwards — including through the connect interfaces above, which are regenerated with the new macaroon.
+- **When to run it:** if a macaroon may have been exposed. Note that a service reading LND's admin macaroon through a mount has full control of the node, which is why other packages' security fixes sometimes ask you to run this.
+
+### Pay Invoice, Receive Payment
+
+Grouped under Payments. **Pay Invoice** pays a BOLT11 invoice from the node's own funds: paste the invoice, whether its amount is stated in it or entered here — an invoice that leaves the amount open requires one, one that states it refuses one — and the most it may spend in routing fees as a percentage. Every payment requires an explicit confirmation that its amount and destination were verified. A task-prefilled invoice is decoded before the form opens, displayed with its amount, destination and description, and locked; the handler refuses it if it differs from the reviewed invoice. Payment uses a 60-second route-finding limit and returns the amount, fee, description, destination and preimage; a failure returns LND's reason. Only while running, with the wallet unlocked. Not idempotent — running it twice pays twice if the invoice allows it, which a single-use BOLT11 does not. A companion service can raise it as a task with the invoice filled in, so a payment it needs is one reviewed prompt the user accepts; the node never hands out credentials.
+
+**Receive Payment** creates a BOLT11 invoice for this node: an optional amount (none makes an amount-less invoice the payer fills in), an optional description carried in the invoice, and an expiry in hours, default 24. Runs `lncli addinvoice --private`, so private channels are included as route hints. Returns the invoice as text and QR code, plus the payment hash. Only while running, with the wallet unlocked. Safe to repeat — each run registers a new invoice and nothing is charged.
+
+### Node Info, Watchtower Server Info
+
+Read-only, running only. The first reports the node's identity, URIs, and sync state; the second reports the watchtower server's identity, and is hidden unless that server is enabled. When `lncli` fails, either returns its error output as a copyable multi-line field.
+
+### Configure Continuous Backups, Back Up Channels Now
+
+Grouped under Continuous Backups. `channel.backup` is LND's static channel backup: the file a restore needs to ask your peers to close your channels and return your funds. LND rewrites it whenever your channel set changes, and encrypts it under a key derived from the wallet seed, so a storage provider only ever holds ciphertext.
+
+A continuous backup is a copy of that file kept current on a storage provider, as opposed to the point-in-time copy inside a StartOS backup. Continuous backups supplement StartOS backups: a StartOS restore fetches them with the target settings the backup carried and merges them with its own copy (see Backups and Restore).
+
+**Configure Continuous Backups** takes any combination of Google Drive, Dropbox, Nextcloud, SFTP and Email. Each target has its own enable toggle, so turning one off keeps its saved credentials. After turning a target off, **Forget saved credentials** removes its credentials and settings. Google and Dropbox use an authorization-code exchange: submit once with the client credentials to get a link, approve it, then paste the code back and submit again. A loopback address and a Tor `.onion` address are rejected for every saved target. A copy in another folder of this same server cannot be detected, so the warning asks for a different machine. Nextcloud must be `https://`, and the saved address is completed to the `/remote.php/dav/files/USER/` endpoint rclone's `nextcloud` vendor insists on: a bare server address, the `/remote.php/dav/` interface the StartOS Nextcloud package exports, or `/remote.php/webdav` all become that. An address already naming `/dav/files/` is otherwise kept as pasted; when its user segment matches the previous login, changing that login updates the segment and preserves any subpath. An SFTP key must be an unencrypted OpenSSH key, since rclone has no way to enter a passphrase. The OAuth code exchange is bounded to 30 seconds.
+
+Google ends the sign-in it gives a Google Cloud app still in Testing after 7 days. Publishing the app needs a home page, a privacy policy link and an authorized domain on its Branding page; a logo or more than 10 authorized domains would also need Google's verification. When Google's token response carries `refresh_token_expires_in`, the action's result gives the date the sign-in ends; a pasted refresh token carries no date. A refresh token the provider refuses makes rclone report `invalid_grant`, and Drive answers a revoked access token with `authError`; the agent records either as a `signin` failure: its message says to sign in again, and why a Testing app needs it, in place of rclone's error. While that failure is on record, submitting the action offers the authorization link again, as it does for a target with no token. An enabled Google or Dropbox target with no token yet fails as `nocreds`, shown as not signed in yet. Other remote errors have their HTTP request URLs removed before the detail is capped at 160 characters, keeping the underlying error visible when a long Drive URL precedes it.
+
+SFTP servers are pinned by host key, and the pin is confirmed before it is used. Saving the target records the keys the server presents (`ssh-keyscan`) and reports their fingerprints, but nothing is sent until a later save with _Host key verified_ turned on; the health check says so in the meantime, and saving with the toggle off withdraws that trust. Only a scan that finished cleanly, every line a whole key that `ssh-keygen` can fingerprint, is recorded. A changed host or port drops the pin, as does _Record a new host key_ after a server reinstall. Folder paths on every target must be relative, with no `..` segments. An SFTP path is resolved against the directory the server puts the login in, which rclone reads from the server on connect: the home directory on a stock OpenSSH server, the top of a share or of the chroot on a NAS or a chrooted account.
+
+Email is a different kind of target: the agent sends `channel.backup` as a MIME attachment over SMTP instead of storing a file, so there is nothing for a restore to read back — `backup-agent.sh --pull` skips it, and it never appears in a restore's list of targets. An attachment reaches LND through [Restore Channels from File](#restore-channels-from-file). The SMTP server, port, sender and at least one recipient are required, and a username without a password is refused. Port 465 is taken as implicit TLS; every other port must upgrade with STARTTLS, so the login and the attachment never travel without TLS. The sender must be an address the SMTP server allows this login to send as, and recipients are a comma-separated list. A blank subject and a blank message are filled in, the subject naming the time the copy was sent, and a blank username means a server that needs no login. The message body allows line breaks and tabs and nothing else, so no header line can be smuggled into the message. The password reaches curl through a mode-0600 temporary file, never as a command line argument, and the file is removed as soon as the send ends. Mail goes out when `channel.backup` changes, when a failed send is retried, and every time Back Up Channels Now runs; a copy already delivered for the current file is not sent again. The message is base64, not encryption: what protects the contents in the mailbox is LND's own encryption of `channel.backup` under a key derived from your seed.
+
+- **What it changes:** writes `channel-backup.json`. No restart.
+- **Repeat safety:** safe; secrets are never prefilled, and left blank they keep their stored value. Email's other fields are the exception: left blank they clear, and the agent fills in what has a default, so blanking the username moves to a server that needs no login. A changed OAuth client id or secret drops the stored token, and a fresh authorization code always replaces it.
+
+**Back Up Channels Now** asks for confirmation, then runs one copy immediately and fails with whatever each target said. Use it to check a freshly configured target without waiting for a channel change; LND writes `channel.backup` at every start, once it has caught up with the chain, whether or not it has channels. It refuses until LND has reported the node's identity, which the agent needs to name the node's folder.
+
+- **Cost:** seconds to a minute; running only.
+
+### Restore Channels from File
+
+Grouped under Continuous Backups. Previews a `channel.backup` the user supplies — an Email target's attachment, or any copy kept by hand — and, once confirmed, hands it to `lncli restorechanbackup --multi_file`, as the restore oneshot does with the copies it finds. The file is pasted as base64 into a textarea; whitespace and the `BEGIN`/`END` lines `certutil -encode` writes are dropped, and the rest must decode as strict base64. The bytes go to `/tmp` in a temporary subcontainer, never to the volume.
+
+- **Preview:** every run first decrypts the file with `lncli verifychanbackup --multi_file`, which restores nothing, and compares its `chan_points` with every channel point in `listchannels`, the four `pendingchannels` categories and `closedchannels`. A file LND cannot open, matched as the restore oneshot matches the copies it skips, is refused there as another seed's or damaged. When every channel in the file is known, the run says restoring changes nothing and stops, whatever the toggle. Otherwise, with **Restore the channels** off, it changes nothing and lists the unknown channel points, with the same-seed warning below.
+- **Confirmation:** turning **Restore the channels** on raises a warning that the action is only for a node that lost its channel data, since a channel of this seed still running on another node would be force-closed, followed by the Lightning Labs advice the restore notice shows.
+- **Result:** the count of channels recovered, LND's `num_restored`, with the next steps: watch the closes confirm, sweep the funds, then uninstall and reinstall. A peer that is offline is still recovered; LND keeps a persistent connection request to it. `ConnectPeer` fails only when the backup gives a peer no dialable address — none, or only Tor v2 onions, which LND strips — with `unable to connect to peer <pubkey> for SCB restore`. LND has then recorded that channel and every earlier one in the file, has not processed the rest, and has queued no connection to that peer; it dials the addresses the graph announces for it at its next start. The action reports that and asks for another run, which skips the recorded channels. Any other failure returns LND's error.
+- **When:** running only. It waits up to 20 seconds for `/v1/state` to report `SERVER_ACTIVE`, which the preview and `restorechanbackup` require, and refuses after that. LND's calls are bounded to 10 seconds for the decrypt, 15 for the listings, run together, and 45 for the restore, inside StartOS's 120-second action limit.
+- **Repeat safety:** safe. LND skips every channel its outpoint index holds, open or closed, so a second run, or a run on the node that wrote the file, recovers nothing.
+- **Availability:** every node, not only a restored one. Only a node restored from a StartOS backup lacks channels its own file can name; on a node that kept its channel database, the preview finds nothing to restore, and another seed's file is refused. The exception is a seed whose LND still runs on another node, whose live channels the restore would force-close; the same-seed warning names that case.
+
+### Cold Storage
+
+Three actions under Cold Storage, and the mode is off unless a user turns it on. Turn On and Turn Off are one action, `cold-storage-toggle`, whose name, text, input and availability follow the mode: Turn On while the mode is off, Turn Off while it is on.
+
+By default LND stores its wallet password and seed in `store.json` and unlocks itself at every start. That is what makes the node self-healing across reboots, and it is also what an attacker with the disk gets. Cold Storage Mode removes both, at the cost of the node being offline from every restart until someone unlocks it by hand.
+
+The two halves are deliberately one switch. Deleting the seed while the password remains changes nothing, because the password alone opens the wallet; deleting the password while the seed remains changes nothing either. Only removing both alters what the disk yields. A wallet whose seed is not on the server — an imported one, or one that has been through the mode before — uses the mode password-only, since the seed is the half that has already left.
+
+1. **Show Credentials** displays the password, and the seed when the server holds one as a masked, numbered grid, and fixes which three seed words will be asked for. It records the challenge, and with it Turn On's availability, only once that display has been built. Nothing is deleted yet.
+2. **Turn On** runs only while LND's own chain is running with its wallet unlocked, with no import or conversion pending, and only once this lifecycle's unlock oneshot has itself opened the wallet with the stored password, which `main` records in `unlock-status.json`; a wallet found already open, an unlock made some other way, or the conversion's temporary LND does not count. It requires the password, plus those three words when a seed is held. It writes a salted scrypt hash of the password first, then removes the password and the seed from `store.json` in one write. That write is the mode: LND is in Cold Storage Mode exactly when `store.json` holds no wallet password, and nothing else records it, so an interruption leaves either a node with its password and an unused hash, or the mode on.
+3. **Unlock Wallet** sends a plain unlock to LND's wallet unlocker, through curl in a temporary subcontainer with the password on stdin, and applies a restore's rescan window when one is pending. It is offered whenever the mode is on, and also whenever LND has refused the stored password in this lifecycle, which `main` records in `unlock-status.json`; both are watched values, never a sampled LND state, and the handler checks LND's live state itself and does nothing when the wallet is already open. When the mode is off and the typed password opens the wallet, that password becomes the stored one, so the node unlocks itself from the next start: that is the way back from a stored password LND no longer accepts. It never rotates macaroons: Revoke Macaroons is unavailable while the mode is on, because the rotation runs at an automatic unlock, which the mode prevents.
+4. **Turn Off** verifies the password against the hash and, while LND is locked, against the wallet itself by unlocking it, since the wallet unlocker needs no macaroon and a `changepassword` made elsewhere would leave the hash describing a password LND no longer takes; a missing hash is refused only while the wallet cannot be asked. It clears the Unlock Wallet task first, while nothing has changed and a failure can simply be retried; then stores the password back, which is what turns the mode off; then drops the hash. The seed does not come back, and the mode can be turned on again with the password alone.
+
+A StartOS backup taken while the mode is on carries neither the password nor the seed: `store.json` holds null for both. Restoring it yields a node in Cold Storage Mode that waits for the recorded password, and the seed, which such a backup never held, is needed only to recover on-chain funds outside StartOS.
+
+**While the mode is on, `unlock-wallet` waits instead of unlocking.** It keeps polling until the wallet passes `LOCKED`, which preserves the requires graph, so `sync-progress`, the restore oneshot and the channel-backup agent stay held rather than running against a locked wallet, and the startup flags are still cleared on the way through. On each lock it raises the Unlock Wallet task and sends one notification, retrying either that failed on the next poll; when the wallet opens, whoever opened it, it clears the task, and a lifecycle that starts with the mode off clears any task a previous one left. `main` never writes `cold-storage.json` or `store.json`'s credentials, so none of its writes can race the actions'.
+
+### Clearnet VPN — hidden
+
+Not user-facing, and raised as a task by a companion package with its tunnel configuration and public address filled in. Its only known uses are the TunnelSats community package and running it by hand with some other WireGuard configuration, which is unsupported. It is not how a node is made reachable or routed: inbound reachability comes from addresses on the node's StartOS interfaces, and outbound traffic leaves through the gateway StartOS selects for it. It stores the configuration and the address; `watchHosts` advertises the VPN address alongside any user-configured external host, and the action turns on `tor.skip-proxy-for-clearnet-targets`, since clearnet peers have to be dialed directly for the tunnel to carry them. Costs a restart. A new configuration replaces the tunnel; an empty one turns it off and drops only the VPN address. Safe to repeat.
+
+### Auto-Configure — hidden
+
+`visibility: 'hidden'`; how a dependent service requests configuration of this node.
+
+## Tasks
+
+Three at install, one raised on Bitcoin, and one raised at each lock while Cold Storage Mode is on.
+
+| Task                         | Raised on | Severity    | Raised when                                                         | Cleared when                                                         |
+| ---------------------------- | --------- | ----------- | ------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Initialize Wallet            | this      | `critical`  | At install                                                          | The action runs                                                      |
+| Bitcoin Backend              | this      | `critical`  | At install                                                          | The action runs                                                      |
+| Configure Continuous Backups | this      | `important` | At install                                                          | The action runs                                                      |
+| Unlock Wallet                | this      | `important` | Each time LND is found locked while Cold Storage Mode is on         | The wallet opens, or Turn Off runs                                   |
+| Auto-Configure               | Bitcoin   | `critical`  | The backend is bitcoind and its ZeroMQ is disabled                  | Bitcoin's config matches; it returns if changed again                |
+| Clearnet VPN                 | this      | `important` | Only when a companion package raises it with a tunnel for this node | The stored configuration matches what the companion package proposes |
+
+The Bitcoin task appears on **Bitcoin's** page with nothing there explaining which service asked for it. LND needs ZeroMQ to be told about new blocks and transactions; polling is not a substitute.
+
+## Health Checks
+
+Which checks exist depends on what the service is doing.
+
+| Check            | Displayed                         | Present                                                |
+| ---------------- | --------------------------------- | ------------------------------------------------------ |
+| `import`         | Wallet Import progress            | While a wallet import is running                       |
+| `db-migration`   | "Database Conversion"             | While a bolt database is being converted               |
+| `lnd`            | "LND Server"                      | Normal operation                                       |
+| `wallet-unlock`  | "Wallet Unlock"                   | Normal operation                                       |
+| `sync-progress`  | "Network and Graph Sync Progress" | Normal operation                                       |
+| `channel-backup` | "Continuous Backup"               | Normal operation; `disabled` until a target is enabled |
+| `reachability`   | "Node Reachability"               | Normal operation                                       |
+| `vpn-tunnel`     | "Clearnet VPN"                    | While a tunnel is configured                           |
+| `restored`       | Restore notice                    | After a restore from a StartOS backup                  |
+
+**`wallet-unlock` reports errors from LND's normal wallet unlock request while the wallet remains locked.** It distinguishes LND's exact wrong-passphrase response from other errors. Unlock attempts continue automatically. While Cold Storage Mode is on, a locked wallet is reported as a failure rather than as start-up, since the node stays offline until someone runs Unlock Wallet.
+
+**`sync-progress` covers two different syncs** — the chain and the network graph — and a node can be caught up on one while still working through the other. It is the check to read while a node is coming up for the first time.
+
+**The graph half can stall on one bad peer, and the check is written to show it.** `synced_to_graph` is a per-process latch that LND sets only when the single peer it elected as the _initial historical syncer_ finishes reconciling the graph. The first peer to connect after a start gets elected, and until the latch is set every other peer is held in `PassiveSync` — passive syncers never send a `GossipTimestampRange`, so they deliver no gossip at all. One unresponsive elected peer therefore stalls the whole gossip subsystem rather than just its own sync. LND re-elects when that peer disconnects or `historicalsyncinterval` (default one hour) elapses; an unusable channel-range response also triggers immediate replacement without disconnecting the peer. A node with no channels is the most exposed, because it keeps no persistent peers and re-draws its first peer from bootstrap on every start.
+
+That state is indistinguishable from a large legitimate backfill through `getinfo` alone, so the message reports what can be distinguished: _Waiting for peers_ when none are connected, a plain _Syncing to graph_ while the wait is still normal, and — past fifteen minutes — how long the sync has been pending, with the peer count, where it is finally diagnostic. **The result stays `loading` in every one of those cases**, so nothing about the wait changes what dependent services see.
+
+`lncli disconnect <pubkey>` on the elected peer forces an immediate re-election, and restarting LND has the same effect by drawing a new first peer.
+
+**The chain half checks that Bitcoin actually serves blocks.** `getinfo`'s `block_height` follows headers, which keep arriving while block fetches fail, so it cannot tell a stuck backend from a slow sync. Once LND has been behind the chain for five minutes, the check has it fetch Bitcoin's tip block (`lncli chain getblock`), the same path its block notifier uses, and repeats every five minutes while it stays behind. A failed fetch changes the message to _Bitcoin is not serving blocks to LND_ with the error, and two in a row also send an error notification, once per episode. The result stays `loading`. There is no probe on Neutrino.
+
+**A `getinfo` that fails or runs past 25 seconds reads _LND is starting…_ (`starting`) only while LND is still starting up.** Once `/v1/state` reports `SERVER_ACTIVE`, or times out after having answered, it reads _LND is running but not responding_ (`loading`), so a node whose RPCs are stalled shows as running with a busy check rather than as restarting. Either way the check isn't `success`, so dependents keep waiting.
+
+**When `/v1/state` times out after LND has answered it, LND Server, Wallet Unlock and the sync check keep LND's last answered state.** A timeout means LND accepted the connection, so the process is up: LND Server stays `success` reading _LND is running but slow to respond_, while a refused connection or `WAITING_TO_START` still reads `starting`. This matters because every daemon that requires `lnd` is stopped the moment its result leaves `success`, which on a slow node would restart unlock-wallet, the sync check and the backup agent and show the service as Starting. A crash is still reported: the SDK marks the daemon failed when the process exits.
+
+**`reachability` reports whether peers can actually open a connection to you**, which is separate from whether LND is healthy. A node that is running fine but unreachable will not receive inbound channels.
+
+**`vpn-tunnel` reads the tunnel's last handshake.** `starting` until the first one, `failure` once it is more than three minutes old — WireGuard rekeys about every two minutes under traffic. A failing tunnel does not leak: the routing rules the package installs send clearnet traffic nowhere but the tunnel, and drop it if the tunnel's interface goes away, so it is never sent over the ISP connection. The `vpn` oneshot that brings the tunnel up runs before the `lnd` daemon and blocks it if the tunnel cannot be created.
+
+**`import` and `db-migration` are progress reporters, not fault detectors.** They exist because both phases can run for hours with the service otherwise looking idle, and both report a real failure with its message if they hit one.
+
+## Backups and Restore
+
+The `main` volume is copied wholesale — `sdk.Backups.ofVolumes('main')` — with a substantial exclude list, and the exclusions are the substance.
+
+- **Excluded:** the network graph, the channel database, the sphinx replay database, the Neutrino chain data and header files, the logs, `startup-flags.json`, `.channel-backup-state.json`, `.channel-backup-email.json`, `.channel-backup.lock`, `unlock-status.json`, and the restore's staging: `channel.backup.startos-restore`, its `.tmp`, and `.channel-backup-restore/`, where the copies retrieved from the targets land.
+- **Included:** `lnd.conf`, `store.json` with the wallet password and seed (both null while Cold Storage Mode is on), `cold-storage.json`, the TLS pair, the macaroons, the wallet database, `channel.backup`, and `channel-backup.json`.
+
+**The channel database is deliberately not backed up.** Restoring a stale one claims channel states the network has moved past, which is how funds are lost — so a restore recovers the wallet and relies on the static channel backup, which asks each peer to force-close and return the funds, rather than resuming the channels.
+
+`startup-flags.json` is excluded for a second reason: a pending import carries the origin node's password in clear text, which must not ride into a backup. On restore the package sets the restore marker and clears any pending import outright — re-running Initialize Wallet is the way to migrate again.
+
+### Where the static channel backup comes from
+
+A StartOS backup carries the `channel.backup` that existed when it was taken, so a channel opened since then is not in it and its funds are not recovered. A continuous backup is a copy kept off the server and updated whenever the channel set changes, which closes that window. The copy is a supplement to the StartOS backup, and it is a StartOS restore that uses it: the backup carries the target settings, and the restore fetches each target's copy with them.
+
+The agent publishes one stable file named `channel.backup` at `<folder>/<node id>/` on each target, where the folder is the target's configured path and the node id is the SHA-256 of the node's identity pubkey (`lncli getinfo`). The id keeps nodes that share one account apart. A restored seed reproduces it, so a restore looks in its own folder on any hardware, and a reinstall with a new seed leaves the old node's copy untouched. The agent reads the identity from LND on each run and exits 7 until LND reports it, which the watcher treats as not ready and retries at the next poll. Every successful upload replaces the copy with the current one; the agent creates no companion markers, generations, or history. An email target is the exception: it stores no file and has no folder — the agent only sends a message, so there is no copy there for anything to replace or for another node to overwrite.
+
+On a restore, LND recovers its channels from every copy that can be found. The restore hook stages the `channel.backup` carried inside the StartOS backup before LND starts, since LND rewrites its own file shortly after unlocking. Once LND reaches `SERVER_ACTIVE` (`restorechanbackup` answers _server is still in the process of starting_ until then), the `restore` oneshot hands that copy to `restorechanbackup`, then asks the agent (`backup-agent.sh --pull`) for the `channel.backup` held by every target with saved credentials, enabled or not, and hands each of those over too. An email target is never consulted: it holds no copy, only the messages it has already sent, and an attachment from one goes to LND through Restore Channels from File instead. Order does not matter and nothing is compared: `restorechanbackup` is additive, skipping channels LND already holds, so what it ends up with is the union of every copy, and a channel opened after the StartOS backup is recovered from the target that has it. A copy LND cannot open belongs to another seed or is damaged; it is skipped with a log line. Any other failure fails the oneshot, and the SDK retries it with the restore flag still set.
+
+A target that cannot be reached is waited for, because its copy may be the only one holding a channel opened since the StartOS backup: the restore notice names the target, the oneshot asks again every five minutes, and clearing that target's saved credentials in Configure Continuous Backups is how to stop waiting. The channel-backup agent does not start, and Back Up Channels Now refuses, until the restore has finished, so the older local copy never replaces a newer one on a target. The oneshot clears the restore flag itself as its last step, after removing the staged copies.
+
+The daemon re-sends every stored copy daily even when nothing changed, so a deleted copy or a revoked credential surfaces within a day; an email already delivered for the current file is not sent again, while Back Up Channels Now always sends one. Failed targets are retried on later runs. The watcher and Back Up Channels Now share one lock; the manual run does not wait for it and reports when a cycle is already running. Every run reads one validated snapshot of `channel-backup.json`, so a save landing mid-run cannot mix two configurations, and a half-written file is retried rather than acted on. The agent's state file is written beside its destination and renamed into place, and a run that cannot record its outcome reports failure. Back Up Channels Now stops starting work after 95 seconds and records the targets it did not reach, so its result always describes what actually happened.
+
+## Limitations and Differences
+
+1. **A restore is a recovery, not a resumption.** The channel database is excluded by design; channels are closed from static backups rather than continued.
+2. **SQLite is the only database backend.** New installs start there and bolt nodes are converted on arrival; the conversion is one-way.
+3. **LND's own chain-backend health check is disabled**, because it does not detect the failure it appears to.
+4. **gRPC cannot be reached through a TLS-terminating path** — its clients reject the rewrap.
+5. **REST and gRPC interfaces do not exist until a wallet does**, because they embed the admin macaroon.
+6. **Bitcoin must have ZeroMQ enabled**, which is requested as a task on that service.
+7. **Onion-message protocol overrides are stripped**, since LND 0.21 advertises the feature natively and the old overrides now prevent startup.
+8. **An import is bounded at six hours** and copies over the network from the origin node.
+9. **No riscv64 build.** x86_64 and aarch64 only.
+10. **On a pruned Bitcoin, the channel graph is not validated against the chain** (`routing.assumechanvalid`), as on Neutrino.
+
+---
+
+## Quick Reference for AI Consumers
+
+```yaml
+package_id: lnd
+image: ./Dockerfile # upstream lnd plus migration, import, and channel-backup tooling
+architectures:
+  - x86_64
+  - aarch64
+subcontainers:
+  - lnd-sub # the running daemon
+  - channel-backup-sub # the channel-backup agent
+  - import-umbrel # created only for a scheduled import (also -mynode, -startos)
+volumes:
+  main: /root/.lnd
+  public: /mnt/public # credentials for dependents; not backed up
+file_models:
+  - /root/.lnd/lnd.conf
+  - /root/.lnd/store.json
+  - /root/.lnd/startup-flags.json # excluded from backups; can hold an origin password
+  - /root/.lnd/channel-backup.json # backup targets and their credentials
+  - /root/.lnd/.channel-backup-state.json # excluded from backups; the agent's outcomes
+  - /root/.lnd/.channel-backup-email.json # excluded from backups; the email delivery record
+  - /root/.lnd/cold-storage.json # the hash Turn Off checks against, and what Show Credentials fixed
+  - /root/.lnd/unlock-status.json # excluded from backups; written by main only
+  - /root/.lnd/.channel-backup-restore/ # excluded from backups; copies retrieved from the targets during a restore
+  - /root/.lnd/vpn/wg0.conf # generated from store.json's clearnetVpn on every start
+channel_backup_files:
+  - /root/.lnd/data/chain/bitcoin/mainnet/channel.backup
+startos_managed_env_vars: []
+dependencies: # both conditional on configuration
+  - bitcoind # when the backend is bitcoind; /mnt/bitcoin, read-only
+  - tor # when Tor is enabled
+interfaces:
+  peer: { type: p2p, port: 9735 }
+  watchtower: { type: p2p, port: 9911 } # exported always; LND listens only when enabled
+  lnd-connect-rest: { type: api, port: 8080 } # once the macaroon exists; embeds it
+  grpc: { type: api, port: 10009 } # once the macaroon exists; TLS passthrough
+actions:
+  - general
+  - routing-fees-config
+  - channels-config
+  - autopilot-config
+  - tor-config
+  - custom-external-host-config
+  - performance-config
+  - watchtower-server-config
+  - watchtower-client-config
+  - backend-config # hidden; raised by task
+  - initialize-wallet # hidden, only-stopped; raised by task
+  - reset-wallet-transactions
+  - revoke-macaroons
+  - node-info # only-running
+  - pay-invoice # only-running; a companion service may raise it as a task
+  - receive-payment # only-running
+  - tower-info # only-running; hidden unless the tower is enabled
+  - autoconfig # hidden; driven by dependents
+  - configure-channel-backup
+  - backup-channels-now # only-running
+  - restore-channels-from-file # only-running; previews a pasted base64 channel.backup, restores only with its toggle on
+  - cold-storage-prepare
+  - cold-storage-toggle # Turn On, only-running, while the mode is off; Turn Off while it is on
+  - unlock-wallet # only-running; offered while Cold Storage Mode is on or the stored password was refused
+  - clearnet-vpn # hidden; raised as a task by a companion package
+tasks:
+  - { action: initialize-wallet, severity: critical }
+  - { action: backend-config, severity: critical }
+  - { action: autoconfig, severity: critical } # on bitcoind, for ZeroMQ
+  - { action: configure-channel-backup, severity: important }
+health_checks:
+  - lnd # displayed "LND Server"
+  - wallet-unlock # displayed "Wallet Unlock"; reports normal unlock errors while the wallet remains locked; also fails while Cold Storage Mode waits for a manual unlock
+  - sync-progress # displayed "Network and Graph Sync Progress"; synced_to_chain, synced_to_graph, num_peers; fetches Bitcoin's tip block while behind the chain
+  - channel-backup # displayed "Continuous Backup"; disabled until a target is enabled
+  - reachability # displayed "Node Reachability"
+  - vpn-tunnel # displayed "Clearnet VPN"; only while a tunnel is configured; last-handshake age
+  - import # only while a wallet import runs
+  - db-migration # only while a bolt database is converted
+  - restored # only after a restore from a StartOS backup
+```

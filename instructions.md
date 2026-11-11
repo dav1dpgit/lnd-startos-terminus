@@ -1,0 +1,112 @@
+# LND
+
+## Documentation
+
+- [Start9 Bitcoin Guides](https://docs.start9.com/bitcoin-guides/) — connecting wallets and dashboards to a Lightning node on StartOS, and migrating an existing LND node onto one.
+- [LND operator documentation](https://docs.lightning.engineering/lightning-network-tools/lnd) — the upstream guide to running and configuring LND.
+
+## What you get on StartOS
+
+A full **LND** node on Bitcoin mainnet, with **REST** and **gRPC** LND Connect interfaces, a **Peer** interface for inbound Lightning connections, and an optional **Watchtower** server. StartOS manages the wallet lifecycle — creation, password storage, and auto-unlock on every start — so you never run `lncli create` or `lncli unlock`. It runs on the **SQLite** database backend, Lightning Labs' recommended modern backend.
+
+## Getting set up
+
+LND posts two critical tasks on install; you can't start it until both are done:
+
+1. **Initialize Wallet** — **Start Fresh** for a new wallet, or **Migrate from Umbrel** / **Migrate from myNode** / **Migrate from StartOS** to import one from a node on your local network. **Migrate from StartOS** needs the old server on StartOS 0.4.0 or later. Start Fresh shows your 24-word seed **once**, as a numbered grid you reveal — write it down. It is not a BIP-39 seed and works only with LND. **The seed alone is not enough:** it recovers _on-chain_ funds only; funds in channels can be recovered only from the **Static Channel Backup** in your StartOS backups, so keep backups (see [Backups](#backups)). Choosing a migration option checks that your address and password reach the origin node and schedules the migration; the migration itself runs **when you start LND** — it shuts the origin down, copies its data, and converts the database before LND comes online, which can take hours on a large node. Watch it under **Health Checks**. If the migration fails repeatedly, LND stops itself and re-posts the **Initialize Wallet** task — run it again to correct the address or password and retry. Once the migration has finished, **never start LND on the origin device again** — two nodes sharing one seed loses funds. The full walkthrough is in the [LND migration guide](https://docs.start9.com/bitcoin-guides/lnd-migration).
+2. **Bitcoin Backend** — **Bitcoin** (recommended if you run it on this server) or **Neutrino** (built-in light client). Choosing Bitcoin posts a task on it to enable ZMQ.
+
+Then start LND. A third, non-blocking task suggests setting up **Continuous Backups** (see [Backups](#backups)); you can do that at any time.
+
+On every start, **Network and Graph Sync** goes through _Syncing to graph_ before it reaches _Synced_ — usually well under three minutes. If it reads _Waiting for peers_, LND has not connected to any yet. LND depends on a single peer it picks at startup to hand over the channel graph, and if that peer stops responding the sync waits on it; the check then tells you how long it has been pending. LND switches peers immediately if the response is unusable; a peer that never answers can still hold the sync until the hourly retry, so this normally clears itself. If you would rather not wait, restart LND — it picks a different peer. A node with no channels sees this most often, because it has no regular peers to reconnect to.
+
+If **Network and Graph Sync** reads _Bitcoin is not serving blocks to LND_, LND has fallen behind the chain because Bitcoin cannot hand it blocks — check the **Bitcoin** service and its logs. If it lasts, you also get a notification. Until it clears, LND cannot see new blocks, which it needs to protect your channels.
+
+**Wallet Unlock** reports errors from LND's normal wallet unlock request while the wallet remains locked. A refused stored password is identified separately from other errors. Unlock attempts continue automatically.
+
+## Using LND
+
+### Connecting wallets and apps
+
+Open the **REST** or **gRPC LND Connect** interface and copy the `lndconnect://` URI (or scan the QR) into your wallet. It embeds your admin macaroon — treat it like a password. These interfaces appear only after the wallet is initialized.
+
+For **REST**, StartOS serves the connection with your server's own certificate, so leave certificate validation **on** in your wallet. Wallets such as Zeus verify it the same way your browser does — over your local network that means having the [StartOS Root CA](https://docs.start9.com/start-os/trust-ca) installed on the device, exactly as for the StartOS dashboard. If you have set up a custom domain with an ACME certificate, wallets trust it with no extra step.
+
+For **gRPC**, LND serves the certificate your server issued it, and the `lndconnect://` URI carries your server's Root CA so your wallet can verify it — nothing to install on the device. The gRPC QR is denser than the REST one; copy the URI instead if your camera can't read it.
+
+### Reachability and networking
+
+Other nodes connect to you over the **Peer** interface; run **Node Info** for your shareable peer URI. Whether others can reach you depends on the addresses your node advertises:
+
+- **Tor** — Tor is a separate marketplace service, not built in. Install and start **Tor**, and LND will route outbound connections through it (on by default; change in **Tor Settings**). To be reachable _inbound_ over Tor, also add an onion service to the **Peer** interface (the interface's **Tor** table, or the Tor service's **Manage Onion Services** action).
+- **Clearnet** — set a **Custom External Host** (e.g. a VPN endpoint) to advertise a clearnet address alongside any onion. A public domain on the Peer interface also works, but only with **Skip for clearnet peers** enabled in **Tor Settings**.
+- If no address is advertised, the **Node Reachability** health check shows _disabled_: you can still open channels outbound, but others can't open channels to you.
+
+If you publish the **Peer** interface through StartTunnel to keep your home IP private, send LND's outbound traffic through that tunnel too. Connections LND opens itself, to the peers it connects to and opens channels with, otherwise leave through your home router, so those peers see your home IP. While LND sends clearnet connections through Tor, this doesn't apply. If you use the tunnel for another reason, such as a port your router can't forward, there is nothing to change.
+
+### Paying and receiving
+
+**Pay Invoice** pays a Lightning invoice from your node without a wallet app: paste it, enter an amount only if the invoice leaves it open, set the most you are willing to pay in routing fees, verify the amount and destination, and confirm. The result shows what was paid and the preimage. A service that needs a payment from you can raise the same prompt with the invoice filled in; LND decodes and locks that invoice and shows its amount, destination and description before you approve it.
+
+**Receive Payment** creates an invoice for someone to pay you: set an amount (or leave it empty to let them choose), a description they will see, and how long it stays payable, then show them the QR code or send them the invoice text. Both live under **Payments**.
+
+### Configuration
+
+Configure LND through its settings actions — General, Routing Fees, Channel Settings, Autopilot, Performance, Watchtower Server/Client, Bitcoin Backend, Tor, and Custom External Host. You can also edit `lnd.conf` directly: your settings are preserved across restarts, except for a few keys StartOS manages for you (`externalip`/`externalhosts`, `tor.socks`, the Bitcoin backend connection settings, and `routing.assumechanvalid`). The SQLite connection pool uses LND's default of 2 connections per database; StartOS removes any `db.sqlite.maxconnections` override.
+
+**Not routing any payments?** Check **Reject Routing Requests** under **Channel Settings**. With it on, LND still sends and receives payments but refuses to be used as a hop, and the log shows `node configured to disallow forwards` each time it turns one away.
+
+Two advanced actions worth knowing: **Reset Wallet Transactions** rescans the chain for on-chain transactions LND may have missed; **Revoke Macaroons** revokes every existing macaroon and mints fresh ones, after which you must reconnect wallets with the new `lndconnect://` URI. If LND cannot answer the revocation request during startup, it retries instead of treating the missing response as success.
+
+Run **Revoke Macaroons** if a macaroon may have been copied or exposed — for example if you run BTCPay Server, which reads LND's admin macaroon and shipped an actively exploited vulnerability in versions before 2.4.2. Every other service connected to LND also loses access until it picks up the new macaroon, so expect to restart them.
+
+## Backups
+
+StartOS backs up LND with its system backup. **For a Lightning node this is essential:** your seed recovers on-chain funds only, while channel funds can be recovered only by force-closing from LND's **Static Channel Backup**, which is included in StartOS backups. Back up regularly.
+
+**Continuous Backups** add to this and do not replace it: only a StartOS backup holds your wallet, and a StartOS restore is what uses the copies.
+
+### Continuous Backups
+
+A StartOS backup holds the channel backup as it was the moment you took it. Open a channel afterwards and that channel is missing from it, so its funds are not recovered.
+
+A continuous backup closes that gap: a copy of the channel backup kept current on a storage provider. Run **Configure Continuous Backups**, pick any combination of Google Drive, Dropbox, Nextcloud, SFTP and Email, and a copy is sent there every time your channels change. The current copy is kept as `channel.backup` in a folder named for this node inside the folder you choose, so several nodes can share one account without overwriting each other. Email is the exception: it sends the file as an attachment to the addresses you give it rather than keeping a folder, and a restore reads copies back from every other target but not from email. The backup is encrypted by LND with a key derived from your seed. Prefer somewhere you control, and use two targets if you can. A copy on this same server dies with it, so choose another machine. Only loopback addresses can be detected and refused; a folder elsewhere on the same disk cannot be told apart from a real target.
+
+Google Drive and Dropbox need approving in a browser: fill in the client credentials and submit once to get a link, approve it, then paste the code it gives you back into the form and submit again. For Google Drive, publish your Google Cloud app before you approve it, or Google ends the approval after 7 days and the backups stop. Publishing needs an **Application home page**, an **Application privacy policy link** and an **Authorized domain** on the app's **Branding** page, and no logo; **Publish app** then appears under **Audience**. Without a website of your own, you would have to approve again every 7 days, so Dropbox, Nextcloud or SFTP may suit you better. For Nextcloud, use an app password from **Settings → Security** and the `https://` address you open Nextcloud at; its WebDAV address works too. For SFTP, either a password or an SSH private key without a passphrase works, and the folder path is relative to the directory your SFTP login starts in — your home directory on most servers, somewhere else on a NAS or a chrooted account; connect with an SFTP client and run `pwd` to see it. Saving records the server's host key and shows its fingerprint; compare it with your server, then save again with **Host key verified** turned on. Nothing is sent to the server until you do. Turning a target off keeps its settings; turn it off and select **Forget saved credentials** to remove them.
+
+For Email, enter your provider's SMTP server and port — 587 for a server that upgrades with STARTTLS, 465 for one that uses implicit TLS — the address the mail is sent from, and one or more recipients separated by commas. Use an app password if your provider asks for one instead of your normal password, and send from an address your provider lets you send as; several mailboxes at different providers are better than one. The subject and the message may be left blank and are then filled in for you. Each message carries the channel backup itself as an attachment. A StartOS restore never fetches it: after a restore, you give the newest attachment to **Restore Channels from File** yourself (see [Restoring from backup](#restoring-from-backup)). Enable another target as well if you want a StartOS restore to cover channels opened after your last StartOS backup on its own.
+
+Once LND has caught up with the chain and written its Static Channel Backup, run **Back Up Channels Now**. It reports what each target said, so you find a typo immediately rather than at restore time. The **Continuous Backup** health check then shows how long ago every enabled target last succeeded, and names any target that starts failing.
+
+### Restoring from backup
+
+Restoring asks each peer to force-close from the Static Channel Backup, and shows a persistent warning. If you configured continuous backups, the restore also fetches the copy from every target that has saved credentials, disabled ones included, and recovers channels from all of them together, so a channel opened after that StartOS backup is recovered too. Email is not among them: it has sent messages, not copies to fetch. You restore from your StartOS backup as usual; nothing has to be fetched from a provider by hand. The restore waits for every target to answer; if one is gone for good, clear its saved credentials in **Configure Continuous Backups** so the restore can finish, and the restore notice names the target it is waiting on. Copies are not sent to your targets again until the restore has finished.
+
+If you hold a copy of `channel.backup` the restore could not fetch — an emailed one, or one you saved yourself — run **Restore Channels from File** once LND has caught up with the chain, and paste the file as base64. On macOS or Linux, `base64 < channel.backup` prints it; on Windows, `certutil -encode channel.backup channel.txt` writes it to `channel.txt`, and you paste all of that file. Run it first with **Restore the channels** off: it lists the channels in the file that this node does not know, and changes nothing. A copy made under another seed is refused, and one with no channel this node does not know has nothing to restore. Then run it again with **Restore the channels** on to restore them. Each is force-closed by its peer, as in the restore, and the result lists what to do next. A peer that is offline is asked once LND reaches it.
+
+**Run it only on a node that lost its channel data.** If LND with this seed is still running anywhere else, such as the old server left on after you restored to a new one, stop it first, or its channels get force-closed.
+
+**Lightning Labs strongly recommends against continued use of a restored node:** once funds are back on-chain, sweep them to another wallet, then uninstall and reinstall LND fresh.
+
+## Cold Storage Mode
+
+By default this server stores your wallet password and seed, and unlocks LND for you at every start. That is what keeps the node running through reboots without you. It also means someone who takes the disk has everything they need to spend your on-chain funds and close your channels.
+
+**Cold Storage Mode** removes both from the server. After that, LND starts locked and stays offline until you enter the password yourself.
+
+**Read this before turning it on.** LND restarts more often than people expect: whenever Bitcoin restarts, when StartOS updates, and whenever the server reboots. Each time, your node is offline until you unlock it. An offline Lightning node cannot route, cannot receive, and cannot respond when a peer closes a channel — and peers may force-close channels on a node that stays away. If you cannot check this server regularly, leave the mode off.
+
+Turning it on takes two steps, in **Actions → Cold Storage**:
+
+1. **Show Credentials** displays your wallet password and, if this server still holds it, your seed one last time as a numbered grid, and tells you which three seed words you will be asked for. Write them down and store them offline. Nothing is deleted at this point.
+2. **Turn On** asks for the password and those three words — the password alone if no seed is held — then removes them from the server and restarts LND. It runs only while LND is running and has been unlocked with the stored password in this run, so the password it deletes is one that opened the wallet.
+
+From then on, after every restart you get a **Wallet Locked** notification and an **Unlock Wallet** task on the dashboard. Run it, enter your password, and the node comes back. Unlock Wallet also appears whenever LND refuses the password this server has stored; entering the right one there brings the node online and stores it again. The **Wallet Unlock** health check shows red the whole time it is waiting. **Revoke Macaroons** is unavailable while the mode is on: turn the mode off, run it, and turn the mode back on.
+
+Once the mode is on, Turn On becomes **Turn Off**. It puts the password back, returns to unlocking automatically and clears the Unlock Wallet task. Your seed does not come back — the server never kept a copy after you turned the mode on, and it does not need one. A StartOS backup taken while the mode is on holds neither the password nor the seed, so restoring it gives you a node in Cold Storage Mode that waits for the password you recorded. The seed is needed only to recover on-chain funds outside StartOS, and you can turn the mode on again later with just the password.
+
+## Limitations
+
+- **Mainnet only** — no testnet, signet, or regtest.
+- **Wallet is managed by StartOS** — `lncli create` and `lncli unlock` are not used.
+- **On a pruned Bitcoin, LND takes channel announcements on trust**, as it always does on Neutrino, because a pruned node no longer has the blocks to check them against. This affects only LND's map of the network for finding payment routes, not how it watches your own channels.

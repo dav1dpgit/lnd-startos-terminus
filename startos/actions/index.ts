@@ -1,0 +1,52 @@
+import { sdk } from '../sdk'
+import { autoconfig } from './config/autoconfig'
+import { backupChannelsNow } from './backupChannelsNow'
+import { prepareColdStorage, toggleColdStorage } from './coldStorage'
+import { unlockWallet } from './unlockWallet'
+import { configureChannelBackup } from './configureChannelBackup'
+import { backendConfig } from './backend'
+import { autopilotConfig } from './config/autopilot'
+import { channelsConfig } from './config/channels'
+import { clearnetVpn } from './clearnetVpn'
+import { payInvoice } from './payInvoice'
+import { receivePayment } from './receivePayment'
+import { restoreChannelsFromFile } from './restoreChannelsFromFile'
+import { customExternalHostConfig } from './config/customExternalHost'
+import { general } from './config/general'
+import { performanceConfig } from './config/performance'
+import { routingFeesConfig } from './config/routing-fees'
+import { torConfig } from './config/tor'
+import { wtClientConfig } from './config/watchtowerClient'
+import { watchtowerServerConfig } from './config/watchtowerServer'
+import { initializeWallet } from './initializeWallet'
+import { nodeInfo } from './nodeInfo'
+import { revokeMacaroons } from './revoke-macaroons'
+import { resetWalletTransactions } from './resetTxns'
+import { towerInfo } from './towerInfo'
+
+export const actions = sdk.Actions.of()
+  .addAction(general)
+  .addAction(routingFeesConfig)
+  .addAction(channelsConfig)
+  .addAction(autopilotConfig)
+  .addAction(torConfig)
+  .addAction(customExternalHostConfig)
+  .addAction(backendConfig)
+  .addAction(performanceConfig)
+  .addAction(watchtowerServerConfig)
+  .addAction(wtClientConfig)
+  .addAction(resetWalletTransactions)
+  .addAction(towerInfo)
+  .addAction(nodeInfo)
+  .addAction(initializeWallet)
+  .addAction(revokeMacaroons)
+  .addAction(autoconfig)
+  .addAction(configureChannelBackup)
+  .addAction(backupChannelsNow)
+  .addAction(restoreChannelsFromFile)
+  .addAction(prepareColdStorage)
+  .addAction(toggleColdStorage)
+  .addAction(unlockWallet)
+  .addAction(clearnetVpn)
+  .addAction(payInvoice)
+  .addAction(receivePayment)
