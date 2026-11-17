@@ -2,7 +2,7 @@
 
 Start9's [`lnd-startos`](https://github.com/Start9Labs/lnd-startos) package (full history) with one change: the `lnd`
 and `lncli` binaries are built from LND's own release tag with [`patches/lnd-terminus.patch`](patches/lnd-terminus.patch).
-Everything else is Start9's package. Current version: **`0.21.6-beta:4.1`** (LND `v0.21.6-beta`).
+Everything else is Start9's package. Current version: **`0.21.8-beta:0.1`** (LND `v0.21.8-beta`).
 
 **Status: first release, not yet run on an operator's server.** Install it with the publisher on a call.
 
@@ -35,14 +35,14 @@ each file's fingerprint. Check your file before installing:
 
 ## The version
 
-Start9's number plus `.1` (Start9's `0.21.6-beta:4` → `0.21.6-beta:4.1`). Same package id (`lnd`), same data, no-op
+Start9's number plus `.1` (Start9's `0.21.8-beta:0` → `0.21.8-beta:0.1`). Same package id (`lnd`), same data, no-op
 migrations both ways.
 
 - Every LND app's version rule accepts it (BTCPay, RTL and others name plain LND version ranges).
 - Start9's next LND release shows in Updates. Taking it puts the stock binaries back — same data, nothing lost — and
   the LIJOX adapter's "LND (Terminus)" check turns red until the matching Terminus build is installed.
-- How to tell the builds apart: `lncli getinfo` → `"version": "… commit=v0.21.6-beta-terminus"`. Start9's reads
-  `commit=v0.21.6-beta`.
+- How to tell the builds apart: `lncli getinfo` → `"version": "… commit=v0.21.8-beta-terminus"`. Start9's reads
+  `commit=v0.21.8-beta`.
 
 ## What it changes in LND's settings
 
