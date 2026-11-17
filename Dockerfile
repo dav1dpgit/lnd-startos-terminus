@@ -9,7 +9,7 @@ ARG RCLONE_VERSION=1.75.2
 # own Dockerfile at that tag. terminus/follow-start9.sh sets both. The build stamps "-terminus" into LND's version
 # (lncli getinfo → "version": "<x> commit=<tag>-terminus"), which is how the LIJOX adapter package tells this build
 # from stock LND. Everything outside this block and the two COPY lines at the end of the file is Start9's file.
-ARG LND_TAG=v0.21.6-beta
+ARG LND_TAG=v0.21.8-beta
 ARG TERMINUS_GO_IMAGE=golang:1.27.3-alpine
 
 FROM ${TERMINUS_GO_IMAGE} AS terminus-builder
@@ -44,7 +44,7 @@ RUN case "${TARGETARCH}" in \
     unzip -q rclone.zip && \
     install -m 0755 "rclone-v${RCLONE_VERSION}-linux-${TARGETARCH}/rclone" rclone
 
-FROM lightninglabs/lnd:v0.21.6-beta
+FROM lightninglabs/lnd:v0.21.8-beta
 
 # The base image's CA store is only as current as its last release.
 RUN apk add --no-cache --upgrade ca-certificates ca-certificates-bundle
@@ -58,7 +58,7 @@ RUN apk add --no-cache curl sqlite openssh-client sshpass flock wireguard-tools 
 COPY --from=rclone-fetch /out/rclone /usr/local/bin/rclone
 
 # lndinit drives the bolt → SQLite database migration.
-COPY --from=lightninglabs/lndinit:v0.1.38-beta-lnd-v0.21.6-beta /bin/lndinit /bin/lndinit
+COPY --from=lightninglabs/lndinit:v0.1.38-beta-lnd-v0.21.8-beta /bin/lndinit /bin/lndinit
 
 # Continuous off-box copy of channel.backup (see startos/main.ts).
 COPY backup-agent.sh /usr/local/bin/backup-agent.sh
