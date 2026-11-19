@@ -1,5 +1,6 @@
 import { T } from '@start9labs/start-sdk'
 import {
+  rpcCookieName,
   rpcHostId as btcRpcHostId,
   rpcPort as btcRpcPort,
   zmqHostId as btcZmqHostId,
@@ -60,7 +61,7 @@ export const getBitcoindBundle = async (effects: T.Effects) => {
   return {
     'bitcoin.node': 'bitcoind' as const,
     'bitcoind.rpchost': rpchost ?? undefined,
-    'bitcoind.rpccookie': `${bitcoindMnt}/.cookie`,
+    'bitcoind.rpccookie': `${bitcoindMnt}/${rpcCookieName}`,
     'bitcoind.zmqpubrawblock': block ? `tcp://${block}` : undefined,
     'bitcoind.zmqpubrawtx': tx ? `tcp://${tx}` : undefined,
     'fee.url': undefined,
@@ -271,3 +272,64 @@ function describeFailure(f: BackupFailure): string {
 
 export const describeFailures = (failures: BackupFailure[]) =>
   failures.map(describeFailure).join(' ')
+
+// Record the server's host keys. They are used only once the user has
+// confirmed the fingerprints returned here.
+export async function scanHostKeys(
+  effects: T.Effects,
+  host: string,
+  port: string,
+  label: string,
+): Promise<{ knownHosts: string; fingerprints: string }> {
+  return sdk.SubContainer.withTemp(
+    effects,
+    { imageId: 'lnd' },
+    mainMounts,
+    'keyscan',
+    async (sub) => {
+      const scan = await sub.exec(
+        ['ssh-keyscan', '-T', '10', '-p', port, host],
+        { timeout: 40_000 },
+      )
+      // Only whole key lines from a scan that finished: a cut-off run leaves
+      // partial lines that ssh-keygen and rclone reject, or none at all.
+      const lines = String(scan.stdout)
+        .split('\n')
+        .filter((l) => l && !l.startsWith('#'))
+      const unreachable = i18n(
+        '${label}: ${host} did not answer with a host key. Check the address and port, and that the server is reachable from here.',
+        { label, host: literal(`${host}:${port}`) },
+      )
+      if (!lines.length) throw new Error(unreachable)
+      if (
+        scan.exitCode !== 0 ||
+        !lines.every((l) =>
+          /^\S+ (ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-\S+) [A-Za-z0-9+/]+={0,2}$/.test(
+            l,
+          ),
+        )
+      )
+        throw new Error(
+          i18n(
+            '${label}: the host key ${host} presented could not be read. Try again.',
+            { label, host: literal(`${host}:${port}`) },
+          ),
+        )
+      const knownHosts = lines.join('\n')
+      const fp = await sub.exec(['ssh-keygen', '-lf', '-'], {
+        input: knownHosts + '\n',
+      })
+      const fingerprints = String(fp.stdout)
+        .split('\n')
+        .filter((l) => l.trim())
+      if (fp.exitCode !== 0 || fingerprints.length !== lines.length)
+        throw new Error(
+          i18n(
+            '${label}: the host key ${host} presented could not be read. Try again.',
+            { label, host: literal(`${host}:${port}`) },
+          ),
+        )
+      return { knownHosts, fingerprints: fingerprints.join('\n') }
+    },
+  )
+}
