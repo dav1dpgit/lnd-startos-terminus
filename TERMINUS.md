@@ -2,9 +2,10 @@
 
 Start9's [`lnd-startos`](https://github.com/Start9Labs/lnd-startos) package (full history) with one change: the `lnd`
 and `lncli` binaries are built from LND's own release tag with [`patches/lnd-terminus.patch`](patches/lnd-terminus.patch).
-Everything else is Start9's package. Current version: **`0.21.8-beta:2.1`** (LND `v0.21.8-beta`).
+Everything else is Start9's package. Current version: **`0.21.8-beta:3.1`** (LND `v0.21.8-beta`). Built for StartOS
+0.4.2 or later, as Start9's `0.21.8-beta:3` is.
 
-**Status: first release, not yet run on an operator's server.** Install it with the publisher on a call.
+**Status: running on an operator's server since 2026-11-19.**
 
 ## Why
 
@@ -26,7 +27,8 @@ each file's fingerprint. Check your file before installing:
 
 ## Install
 
-1. Update LND to Start9's newest version first (it must be the version this build's number starts with).
+1. Your LND may be Start9's build or an earlier Terminus build, at any number up to this one: this build installs over
+   it.
 2. Make a StartOS backup. It is for the worst case only: restoring LND from a backup goes through channel recovery,
    which closes its channels.
 3. StartOS → **Sideload** → the `.s9pk`. LND keeps its data, its channels and the apps that use it.
@@ -35,7 +37,7 @@ each file's fingerprint. Check your file before installing:
 
 ## The version
 
-Start9's number plus `.1` (Start9's `0.21.8-beta:2` → `0.21.8-beta:2.1`). Same package id (`lnd`), same data, no-op
+Start9's number plus `.1` (Start9's `0.21.8-beta:3` → `0.21.8-beta:3.1`). Same package id (`lnd`), same data, no-op
 migrations both ways.
 
 - Every LND app's version rule accepts it (BTCPay, RTL and others name plain LND version ranges).
