@@ -103,7 +103,7 @@ def versions(lnd_tag):
              '— the channel LiJ-class wallets ask their LIJOX provider for. A node never asked for that channel type '
              'behaves exactly as Start9\'s build. Installing or updating this build turns on zero-conf and '
              'option-scid-alias (Channel Settings). The LND version line reads "commit=' + lnd_tag + '-terminus". '
-             'Update LND from the LIJOX registry: Start9\'s own LND update puts the stock build back (same data, no loss).')
+             'Update LND only from the LND (Terminus) download page: Start9\'s own LND update puts the stock build back (same data, no loss).')
     m2 = re.search(r'en_US:\s*`([^`]*)`', cur)
     if m2:
         notes += '\n\nStart9\'s notes for ' + stock + ': ' + m2.group(1)

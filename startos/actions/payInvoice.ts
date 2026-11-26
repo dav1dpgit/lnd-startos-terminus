@@ -1,48 +1,20 @@
 import { T } from '@start9labs/start-sdk'
 import { i18n } from '../i18n'
 import { sdk } from '../sdk'
-import { literal, mainMounts, selfGrpcHost } from '../utils'
+import {
+  DecodedPayReq,
+  decodePayReq,
+  literal,
+  mainMounts,
+  selfGrpcHost,
+} from '../utils'
 
 const { InputSpec, Value, Variants } = sdk
-
-type DecodedPayReq = {
-  destination: string
-  num_satoshis: string
-  description: string
-}
 
 const defaultFeePercent = 1
 
 type ReviewedInvoice = { invoice: string; decoded: DecodedPayReq }
 const reviewedInvoices = new Map<string, ReviewedInvoice>()
-
-async function decodePayReq(
-  effects: T.Effects,
-  invoice: string,
-): Promise<DecodedPayReq> {
-  return sdk.SubContainer.withTemp(
-    effects,
-    { imageId: 'lnd' },
-    mainMounts,
-    'decode-pay-invoice',
-    async (subc) => {
-      const decodeRes = await subc.exec([
-        'lncli',
-        `--rpcserver=${selfGrpcHost}`,
-        'decodepayreq',
-        invoice,
-      ])
-      if (decodeRes.exitCode !== 0 || typeof decodeRes.stdout !== 'string') {
-        throw new Error(
-          i18n('The invoice could not be decoded: ${error}', {
-            error: literal(String(decodeRes.stderr).trim()),
-          }),
-        )
-      }
-      return JSON.parse(decodeRes.stdout) as DecodedPayReq
-    },
-  )
-}
 
 const inputSpec = async ({
   effects,
@@ -77,7 +49,7 @@ const inputSpec = async ({
   if (invoice && decoded && effects.eventId) {
     reviewedInvoices.set(effects.eventId, { invoice, decoded })
   }
-  const details = decoded
+  const description = decoded
     ? decoded.num_satoshis === '0'
       ? i18n('Amountless invoice to ${destination}; enter the amount below.', {
           destination: decoded.destination,
@@ -87,9 +59,6 @@ const inputSpec = async ({
           destination: decoded.destination,
         })
     : i18n('A Lightning invoice.')
-  const description = decoded
-    ? `${details} ${i18n('Description')}: ${decoded.description || '-'}`
-    : details
 
   return InputSpec.of({
     invoice: Value.text({
@@ -145,7 +114,7 @@ const inputSpec = async ({
     confirmed: Value.toggle({
       name: i18n('I verified the amount and destination'),
       description: i18n(
-        'Confirm these details before sending. Lightning payments cannot be reversed.',
+        'Check them first with Decode Invoice. Lightning payments cannot be reversed.',
       ),
       default: false,
     }),
@@ -153,7 +122,7 @@ const inputSpec = async ({
 }
 
 type PaymentUpdate = {
-  status?: 'IN_FLIGHT' | 'SUCCEEDED' | 'FAILED'
+  status?: 'UNKNOWN' | 'IN_FLIGHT' | 'SUCCEEDED' | 'FAILED' | 'INITIATED'
   failure_reason?: string
   payment_preimage?: string
   value_sat?: string
@@ -255,18 +224,61 @@ export const payInvoice = sdk.Action.withInput(
           ],
           { timeout: 90_000 },
         )
-        const updates = jsonObjects(String(payRes.stdout)) as PaymentUpdate[]
-        const final = updates[updates.length - 1]
+        const lastUpdate = (stdout: unknown) =>
+          (jsonObjects(String(stdout)) as PaymentUpdate[]).at(-1)
+        let final = lastUpdate(payRes.stdout)
         if (payRes.exitCode !== 0 || final?.status !== 'SUCCEEDED') {
-          throw new Error(
-            i18n('Payment failed: ${reason}', {
-              reason: literal(
-                final?.failure_reason?.replace(/^FAILURE_REASON_/, '') ||
-                  String(payRes.stderr).trim() ||
-                  'unknown',
-              ),
-            }),
+          // RPC errors do not establish payment failure; unconfirmed outcomes stay pending.
+          const trackRes = await subc.exec(
+            [...lncli, 'trackpayment', '--json', decoded.payment_hash],
+            { timeout: 15_000 },
           )
+          const tracked = lastUpdate(trackRes.stdout)
+          if (tracked?.status === 'SUCCEEDED') {
+            final = tracked
+          } else if (
+            tracked?.status === 'FAILED' ||
+            (tracked === undefined &&
+              payRes.exitCode !== null &&
+              trackRes.exitCode !== null &&
+              trackRes.exitCode !== 0 &&
+              /\brpc error: code = NotFound\b/.test(String(trackRes.stderr)))
+          ) {
+            throw new Error(
+              i18n('Payment failed: ${reason}', {
+                reason: literal(
+                  (tracked ?? final)?.failure_reason?.replace(
+                    /^FAILURE_REASON_/,
+                    '',
+                  ) ||
+                    String(payRes.stderr).trim() ||
+                    'unknown',
+                ),
+              }),
+            )
+          } else {
+            return {
+              version: '1' as const,
+              title: i18n('Payment pending'),
+              message: i18n(
+                'The payment of ${amount} sats to ${destination} has no confirmed final result and can still complete. Do not pay a replacement invoice. Run Pay Invoice again with the same invoice to see its final result.',
+                {
+                  amount: String(amountSats),
+                  destination: decoded.destination,
+                },
+              ),
+              result: {
+                type: 'single' as const,
+                name: i18n('Payment hash'),
+                description: null,
+                copyable: true,
+                qr: false,
+                masked: false,
+                value: decoded.payment_hash,
+                launchable: false,
+              },
+            }
+          }
         }
         return {
           version: '1' as const,
@@ -304,9 +316,9 @@ export const payInvoice = sdk.Action.withInput(
                 copyable: false,
                 qr: false,
                 masked: false,
-                type: 'single' as const,
+                type: 'multiline' as const,
                 value: decoded.description || '-',
-                launchable: false,
+                filename: null,
               },
               {
                 name: i18n('Destination'),
